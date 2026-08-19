@@ -1985,11 +1985,14 @@ FOLLOWUP_TEXT = "Hi, please revert as soon as possible."
 COMMENT_PATH = "tickets/{}/comments"
 
 
-def thread_awb_map(mapping_path):
-    """AWB -> {ticketNumber, ticketId} for the mail just sent.
+def thread_ticket_map(mapping_path):
+    """{ticketNumber: {"ticketId", "awb"}} for the mail just sent.
+
+    Keyed on the ticket number because that is the unique identifier - the same AWB
+    can carry more than one ticket, so an AWB-keyed map would silently lose one.
 
     Recorded on the thread itself because Mapping.xlsx is deleted once the run
-    commits - by the time a reply arrives days later, the file is long gone. The
+    commits: by the time a reply arrives days later the file is long gone. The
     internal ticket id comes from the AWB registry, which captured it at fetch time."""
     header, rows = read_mapping(mapping_path)
     try:
@@ -2000,32 +2003,38 @@ def thread_awb_map(mapping_path):
     registry = load_registry()
     out = {}
     for r in rows:
+        num = str(r[tkt_i] or "").strip()
         awb = norm_awb(r[awb_i])
-        if not awb:
+        if not num:
             continue
         entry = registry.get(awb) or {}
-        out[awb] = {"ticketNumber": r[tkt_i] or entry.get("ticketNumber"),
-                    "ticketId": entry.get("ticketId")}
-        if not out[awb]["ticketId"]:
-            print("  warning: no ticket id stored for AWB {} - a reply for it "
-                  "cannot be commented".format(awb))
+        tid = entry.get("ticketId")
+        if not tid:
+            tid = resolve_ticket_id(num)
+            if tid and awb and awb in registry:
+                registry[awb]["ticketId"] = tid
+                save_registry(registry)
+        if not tid:
+            print("  warning: no ticket id for #{} - a reply for it cannot be "
+                  "commented".format(num))
+        out[num] = {"ticketId": tid, "awb": awb}
     return out
 
 
-def record_thread(message_id, subject, awb_map):
+def record_thread(message_id, subject, ticket_map):
     threads = load_threads()
     threads.append({
         "message_id": message_id,
         "subject": subject,
         "sent_ist": datetime.now(IST).isoformat(),
-        "awbs": awb_map,
+        "tickets": ticket_map,
         "status": "awaiting_reply",
         "followup_sent_ist": None,
         "processed": {},
         "seen_replies": [],
     })
     save_threads(threads)
-    print("Thread recorded: {} AWB(s) awaiting reply".format(len(awb_map)))
+    print("Thread recorded: {} ticket(s) awaiting reply".format(len(ticket_map)))
 
 
 def load_threads():
@@ -2114,35 +2123,52 @@ def _status_index(cells):
 
 
 def parse_status_table(html):
-    """AWB -> status from the reply's table. {} when there is no status table.
+    """Rows of {"ticket", "awb", "status"} from the reply's table.
 
-    Walks rows in document order. A header row naming AWB turns parsing on only if it
-    also carries a status column; one without (the quoted original) turns it back
-    off - otherwise the quoted copy of our own mail would blank every ticket."""
-    found = {}
+    Both identifiers are returned because they are not equivalent: a ticket number is
+    unique, an AWB is not - one shipment can have several tickets raised against it.
+    The ticket column is preferred downstream; the AWB is the fallback for replies
+    that don't carry it (Bluedart's own format has no ticket column).
+
+    Walks rows in document order. A header row naming AWB or Ticket turns parsing on
+    only if it also carries a status column; one without (the quoted original) turns
+    it back off - otherwise the quoted copy of our own mail would blank every ticket."""
+    rows = []
     active = False
-    awb_i = status_i = None
+    awb_i = ticket_i = status_i = None
     for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", html or ""):
         cells = [cell_text(c) for c in
                  re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", tr)]
         if not any(cells):
             continue
         low = [c.lower() for c in cells]
-        if any("awb" in c for c in low):                      # a header row
+        if any("awb" in c for c in low) or any("ticket" in c for c in low):
             si = _status_index(cells)
             if si is not None:
-                awb_i = next(i for i, c in enumerate(low) if "awb" in c)
+                awb_i = next((i for i, c in enumerate(low) if "awb" in c), None)
+                ticket_i = next((i for i, c in enumerate(low) if "ticket" in c), None)
                 status_i = si
                 active = True
             else:
                 active = False                                # quoted original
             continue
-        if active and len(cells) > max(awb_i, status_i):
-            awb = norm_awb(cells[awb_i])
-            status = cells[status_i].strip()
-            if re.fullmatch(r"\d{6,}", awb) and status:
-                found[awb] = status
-    return found
+        if not active:
+            continue
+        need = max(i for i in (awb_i, ticket_i, status_i) if i is not None)
+        if len(cells) <= need:
+            continue
+        status = cells[status_i].strip()
+        awb = norm_awb(cells[awb_i]) if awb_i is not None else ""
+        ticket = cells[ticket_i].strip() if ticket_i is not None else ""
+        if not status:
+            continue
+        if not re.fullmatch(r"\d{4,}", ticket):
+            ticket = ""
+        if not re.fullmatch(r"\d{6,}", awb):
+            awb = ""
+        if ticket or awb:
+            rows.append({"ticket": ticket, "awb": awb, "status": status})
+    return rows
 
 
 def html_of(msg):
@@ -2207,6 +2233,96 @@ def find_thread_replies(C, thread):
             if msg is not None and parse_status_table(html_of(msg)):
                 out.append(uid)
     return sorted(out, key=lambda u: int(u))
+
+
+def resolve_ticket_id(ticket_number, max_pages=20):
+    """Internal ticket id from a ticket number, by scanning the ticket list.
+
+    The search API needs a scope this token does not have (403), so this pages
+    newest-first until it finds the number. Only used for AWBs registered before ids
+    were captured; the result is written back to the registry so it happens once."""
+    frm = 1
+    for _ in range(max_pages):
+        d = api_get("tickets?limit=100&from={}&sortBy=-createdTime".format(frm))
+        rows = d.get("data") or []
+        if not rows:
+            return None
+        for t in rows:
+            if str(t.get("ticketNumber")) == str(ticket_number):
+                return t.get("id")
+        frm += 100
+    return None
+
+
+def thread_targets(thread):
+    """{ticketNumber: {"ticketId", "awb"}} for a thread, new or old record shape."""
+    if thread.get("tickets"):
+        return thread["tickets"]
+    out = {}
+    for awb, v in (thread.get("awbs") or {}).items():
+        num = str(v.get("ticketNumber") or "").strip()
+        if num:
+            out[num] = {"ticketId": v.get("ticketId"), "awb": awb}
+    return out
+
+
+def locate_target(threads, current, row, registry):
+    """Resolve one reply row to the ticket it belongs to.
+
+    TICKET NUMBER IS THE KEY. One AWB can have several tickets raised against it, so
+    matching on AWB alone can land a status on the wrong one; the ticket number is
+    unique and we put it in the mail precisely so it comes back.
+
+    AWB is only a fallback, for replies whose table has no ticket column.
+
+    Bluedart also answers on whichever mail is nearest to hand, so a reply to Monday's
+    report routinely carries rows from Wednesday's. Every open thread is searched, and
+    the thread that actually owns the ticket is returned so the update is booked
+    against it rather than against whichever thread we happened to be reading.
+
+    Returns (owner_thread_or_None, {"ticketNumber","ticketId"} or None, description)."""
+    order = [current] + [t for t in threads if t is not current]
+
+    def where(t):
+        return "this thread" if t is current else "thread {}".format(t.get("subject"))
+
+    num = (row.get("ticket") or "").strip()
+    if num:
+        for t in order:
+            meta = thread_targets(t).get(num)
+            if meta:
+                return t, {"ticketNumber": num, "ticketId": meta.get("ticketId")}, where(t)
+        for awb, entry in registry.items():
+            if str(entry.get("ticketNumber") or "") == num:
+                tid = entry.get("ticketId") or resolve_ticket_id(num)
+                if tid:
+                    if not entry.get("ticketId"):
+                        entry["ticketId"] = tid
+                        save_registry(registry)
+                    return None, {"ticketNumber": num, "ticketId": tid}, "AWB registry"
+        tid = resolve_ticket_id(num)
+        if tid:
+            return None, {"ticketNumber": num, "ticketId": tid}, "Desk lookup"
+
+    awb = row.get("awb") or ""
+    if awb:
+        for t in order:
+            for tnum, meta in thread_targets(t).items():
+                if meta.get("awb") == awb:
+                    return t, {"ticketNumber": tnum,
+                               "ticketId": meta.get("ticketId")}, where(t) + " (by AWB)"
+        entry = registry.get(awb)
+        if entry:
+            tid = entry.get("ticketId")
+            if not tid and entry.get("ticketNumber"):
+                tid = resolve_ticket_id(entry["ticketNumber"])
+                if tid:
+                    entry["ticketId"] = tid
+                    save_registry(registry)
+            if tid:
+                return None, {"ticketNumber": entry.get("ticketNumber"),
+                              "ticketId": tid}, "AWB registry (by AWB)"
+    return None, None, "unknown"
 
 
 def comment_on_ticket(ticket_id, awb, status, when):
@@ -2283,6 +2399,7 @@ def process_replies(verbose=True, dry=False):
     if TOKEN is None:
         TOKEN = get_token()
 
+    registry = load_registry()          # global AWB -> ticket, the last-resort lookup
     C = imap_connect(quiet=not verbose)
     made = 0
     try:
@@ -2291,7 +2408,7 @@ def process_replies(verbose=True, dry=False):
             if verbose:
                 print("\nThread {} - {} reply/replies".format(
                     thread["subject"], len(uids)))
-            handled = thread.setdefault("processed", {})
+            thread.setdefault("processed", {})
             seen = thread.setdefault("seen_replies", [])
 
             for uid in uids:
@@ -2303,7 +2420,7 @@ def process_replies(verbose=True, dry=False):
                     continue          # a dry run re-reads them, since it writes nothing
                 statuses = parse_status_table(html_of(msg))
                 if verbose:
-                    print("  reply from {} - {} AWB status(es)".format(
+                    print("  reply from {} - {} status row(s)".format(
                         msg.get("From"), len(statuses)))
                 if not statuses:
                     if verbose:
@@ -2311,43 +2428,60 @@ def process_replies(verbose=True, dry=False):
                     continue
 
                 when = datetime.now(IST).strftime(MAIL_DATE_FMT)
-                for awb, status in statuses.items():
-                    if awb in handled and not dry:
-                        continue
-                    target = (thread.get("awbs") or {}).get(awb)
+                for row in statuses:
+                    awb, status = row.get("awb", ""), row["status"]
+                    owner, target, via = locate_target(threads, thread, row, registry)
                     if not target or not target.get("ticketId"):
-                        print("    SKIP {} - no ticket recorded for this AWB".format(awb))
+                        print("    SKIP ticket {!r} / AWB {!r} - no matching ticket "
+                              "found".format(row.get("ticket"), awb))
                         continue
+                    key = str(target["ticketNumber"])
+                    # Keyed on the ticket number, not the AWB: one AWB can have
+                    # several tickets, so an AWB key would collapse them into one.
+                    # Booked against the thread that owns the ticket, so that report
+                    # closes properly and cannot comment the same ticket twice.
+                    book = (owner or thread).setdefault("processed", {})
+                    if key in book and not dry:
+                        continue
+                    if owner is not thread:
+                        print("    note: ticket #{} belongs to {}".format(key, via))
                     if dry:
                         print("    WOULD COMMENT -> ticket #{}  (id {})".format(
-                            target.get("ticketNumber"), target.get("ticketId")))
-                        print("      AWB {}   remark: {!r}".format(awb, status))
+                            key, target.get("ticketId")))
+                        print("      AWB {}   remark: {!r}   via {}".format(
+                            awb or "-", status, via))
                         made += 1
                         continue
                     try:
-                        comment_on_ticket(target["ticketId"], awb, status, when)
+                        comment_on_ticket(target["ticketId"], awb or "-", status, when)
                     except Exception as e:
-                        print("    FAILED {} -> ticket {}: {}".format(
-                            awb, target.get("ticketNumber"), e))
+                        print("    FAILED ticket {}: {}".format(key, e))
                         continue
-                    handled[awb] = {"status": status,
-                                    "ticketNumber": target.get("ticketNumber"),
-                                    "commented_ist": datetime.now(IST).isoformat()}
+                    book[key] = {"status": status, "awb": awb, "via": via,
+                                 "commented_ist": datetime.now(IST).isoformat()}
                     made += 1
-                    print("    #{} <- {!r}  (AWB {})".format(
-                        target.get("ticketNumber"), status, awb))
+                    print("    #{} <- {!r}  (AWB {})".format(key, status, awb or "-"))
                 seen.append(rid)
 
-            outstanding = [a for a in (thread.get("awbs") or {}) if a not in handled]
-            if handled and not outstanding:
-                thread["status"] = "completed"
-                thread["completed_ist"] = datetime.now(IST).isoformat()
-                print("  thread completed - all {} AWB(s) updated".format(len(handled)))
-            elif handled:
-                # Partial reply: the answered AWBs are done, the rest keep the thread
-                # open so they are still chased rather than quietly abandoned.
-                print("  thread still open - {} AWB(s) unanswered: {}".format(
-                    len(outstanding), ", ".join(outstanding)))
+        # Completion is judged across ALL threads, not just the one being read: a
+        # reply on Monday's mail can finish Wednesday's report by answering its last
+        # outstanding AWB.
+        for t in threads:
+            if t.get("status") != "awaiting_reply":
+                continue
+            done = t.get("processed") or {}
+            outstanding = [n for n in thread_targets(t) if n not in done]
+            if done and not outstanding:
+                if not dry:
+                    t["status"] = "completed"
+                    t["completed_ist"] = datetime.now(IST).isoformat()
+                print("  thread completed ({}): all {} AWB(s) updated".format(
+                    t.get("subject"), len(done)))
+            elif done:
+                # Partial reply: answered AWBs are done, the rest keep the thread open
+                # so they are still chased rather than quietly abandoned.
+                print("  thread still open ({}): {} AWB(s) unanswered: {}".format(
+                    t.get("subject"), len(outstanding), ", ".join(outstanding)))
     finally:
         try:
             C.logout()
@@ -2632,7 +2766,7 @@ def main():
         mailed = False
     else:
         # Recorded BEFORE cleanup deletes Mapping.xlsx, since the map is read from it.
-        awb_map = thread_awb_map(mapping)
+        ticket_map = thread_ticket_map(mapping)
         message_id = send_mapping_mail(mapping, rows)
         mailed = bool(message_id)
         if not mailed:
@@ -2640,7 +2774,7 @@ def main():
             print("re-processes these same tickets rather than skipping them.")
             return 1
         record_thread(message_id, "{} | {}".format(
-            MAIL_SUBJECT, datetime.now(IST).strftime(SUBJECT_DATE_FMT)), awb_map)
+            MAIL_SUBJECT, datetime.now(IST).strftime(SUBJECT_DATE_FMT)), ticket_map)
 
     names = [tickets.name, csv_path.name, merged.name, mapping.name]
     if watermark:
