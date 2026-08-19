@@ -1,0 +1,16 @@
+# Secrets - never commit. Real credentials live here; .env.example documents the keys.
+.env
+
+# Browser profile: holds ClickPost session cookies, i.e. a live login.
+.chrome-profile/
+
+# Generated data. Recreated by every run, and contains customer PII.
+output/
+
+# Runtime state - machine-specific, and meaningless on another checkout.
+state.json
+awb_registry.json
+threads.json
+
+__pycache__/
+*.pyc
