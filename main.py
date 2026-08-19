@@ -7,6 +7,7 @@
   python main.py --skip-desk        # use the newest existing export
   python main.py --skip-clickpost   # part 1 only
   python main.py --asof 2026-08-19  # pin the date Delay Days is measured from
+  python main.py --headed           # show the ClickPost browser (default: headless)
   python main.py --close            # quit Chrome when finished
   python main.py --selftest         # run the OTP-extraction checks, touch nothing
   python main.py --abandon-pending  # discard a stuck run so new tickets can flow
@@ -929,12 +930,25 @@ def close_stale_chrome():
         time.sleep(2)
 
 
-def start_browser(keep_open=True):
+def start_browser(keep_open=True, headless=None):
+    """Launch Chrome on the saved profile.
+
+    Headless by default so a scheduled run doesn't throw a window onto someone's
+    desktop; --headed brings it back for debugging. A fixed window size is set
+    explicitly because --start-maximized does nothing without a desktop, and the
+    ClickPost report builder needs a wide viewport for its Fields panel."""
+    if headless is None:
+        headless = not flag("--headed")
     close_stale_chrome()
     opts = Options()
     opts.add_argument("--user-data-dir={}".format(PROFILE_DIR))
     opts.add_argument("--remote-debugging-port={}".format(DEBUG_PORT))
-    opts.add_argument("--start-maximized")
+    if headless:
+        opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--disable-gpu")
+    else:
+        opts.add_argument("--start-maximized")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     # Chrome offered to save these credentials on the first successful run, then
     # autofilled them on the next one - and the typed value landed on top of the
