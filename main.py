@@ -197,7 +197,7 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def start_pending(state, export_path, watermark):
+def start_pending(state, export_path, watermark, modified_utc=None):
     """Record the in-flight run. Deliberately does NOT touch last_created_utc."""
     prev = state.get("pending") or {}
     state["pending"] = {
@@ -206,6 +206,7 @@ def start_pending(state, export_path, watermark):
         "watermark_utc": watermark["created_utc"].isoformat(),
         "started_ist": datetime.now(IST).isoformat(),
         "attempts": int(prev.get("attempts") or 0) + 1,
+        "modified_utc": modified_utc,
         "stage_reached": "desk",
         "mailer_sent": False,
     }
@@ -260,10 +261,15 @@ def cleanup_run_files(paths, keep=False):
         print("\nCleaned up {} file(s): {}".format(len(removed), ", ".join(removed)))
 
 
-def commit_run(state, ticket, created_utc, export_file, rows, mailed):
+def commit_run(state, ticket, created_utc, export_file, rows, mailed,
+               modified_utc=None):
     """Advance the watermark and clear the pending block."""
     state["last_ticket_number"] = ticket
     state["last_created_utc"] = created_utc
+    if modified_utc:
+        # Advanced on the same terms as the created watermark: only once the mail is
+        # away, so a failed run re-sweeps the same late edits rather than losing them.
+        state["last_modified_utc"] = modified_utc
     state["last_run_ist"] = datetime.now(IST).isoformat()
     state["last_file"] = str(export_file) if export_file else None
     state["rows"] = rows
@@ -490,6 +496,78 @@ def collect_tickets(start_utc, end_utc, inclusive):
     return found
 
 
+# The list endpoint does NOT return modifiedTime unless it is named in `fields`.
+# sortBy=-modifiedTime alone sorts correctly but hands back rows without the field,
+# so the stop condition below would read None on every row and never terminate
+# properly. Verified against the live API on 2026-08-24.
+MODIFIED_FIELDS = "id,ticketNumber,createdTime,modifiedTime,statusType"
+
+# How far back the late-edit sweep will look, by CREATION date. Measured on live data
+# 2026-08-24: 1117 tickets were created earlier and touched that day, but only 179 of
+# them were under a fortnight old - a single bulk update had brushed ~890 tickets aged
+# 14-30 days. Without this bound every run would fetch detail for all 1117.
+#
+# The trade-off is explicit: a ticket rerouted to Logistics MORE than this many days
+# after it was raised is still missed. Fourteen days is well past the point a shipment
+# escalation is still live. Override with LATE_EDIT_LOOKBACK_DAYS in .env.
+LATE_EDIT_LOOKBACK_DAYS = 14
+
+
+def resolve_modified_start(state, created_start_utc):
+    """Where the modified-since sweep begins.
+
+    Falls back to the created watermark, so the very first sweep looks back exactly
+    as far as the created one does rather than over the whole history."""
+    v = state.get("last_modified_utc")
+    return datetime.fromisoformat(v) if v else created_start_utc
+
+
+def collect_modified(start_utc, end_utc):
+    """Tickets whose modifiedTime falls in (start_utc, end_utc], newest first.
+
+    Why this exists: the created-time watermark only ever moves forward, so a ticket
+    created before it and rerouted to Logistics afterwards would never be looked at
+    again - it would be silently absent from every future report. Sweeping by
+    modifiedTime is the only way to see those."""
+    found, frm = [], 1
+    while True:
+        data = api_get("tickets?limit=100&from={}&sortBy=-modifiedTime&fields={}".format(
+            frm, MODIFIED_FIELDS))
+        rows = data.get("data") or []
+        if not rows:
+            break
+        done = False
+        for t in rows:
+            raw = t.get("modifiedTime")
+            if not raw:
+                continue                      # no timestamp to judge it by
+            mt = parse_zoho_time(raw)
+            if mt > end_utc:
+                continue                      # modified after the cutoff - skip
+            if mt <= start_utc:
+                done = True
+                break
+            found.append(t)
+        if done or len(rows) < 100:
+            break
+        frm += 100
+    return found
+
+
+def reported_tickets():
+    """Ticket numbers that have already gone out in a mail, read from threads.json.
+
+    The AWB registry cannot answer this. A registry hit on the SAME ticket number is
+    deliberately NOT treated as a duplicate - that is what makes re-running a day
+    reproduce its rows instead of emptying them. So without this set, a ticket that
+    has already been escalated would be mailed again every time somebody touched it,
+    which is precisely what the modified sweep would otherwise cause."""
+    out = set()
+    for t in load_threads():
+        out.update(str(n) for n in thread_targets(t))
+    return out
+
+
 def fetch_detail(t):
     d = api_get("tickets/{}?include=assignee,departments".format(t["id"]))
     cf = d.get("customFields") or {}
@@ -597,18 +675,68 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     TOKEN = get_token()
     tickets = collect_tickets(start_utc, end_utc, inclusive)
     print("Tickets in window: {}".format(len(tickets)))
-    if not tickets:
+
+    # Second sweep, by modifiedTime, for tickets created BEFORE this window but
+    # touched inside it - the ones a creation-time watermark can never revisit.
+    # Three exclusions keep it to exactly those: anything the first sweep already
+    # returned, anything created inside the window, and anything already mailed.
+    mod_start = resolve_modified_start(state, start_utc)
+    swept = collect_modified(mod_start, end_utc)
+    modified_mark = max((parse_zoho_time(t["modifiedTime"]) for t in swept),
+                        default=None)
+    fresh_ids = {t["id"] for t in tickets}
+    already = reported_tickets()
+    try:
+        lookback = int(ENV.get("LATE_EDIT_LOOKBACK_DAYS") or LATE_EDIT_LOOKBACK_DAYS)
+    except ValueError:
+        lookback = LATE_EDIT_LOOKBACK_DAYS
+    floor_utc = end_utc - timedelta(days=lookback)
+    late, too_old, closed = [], 0, 0
+    for t in swept:
+        if t["id"] in fresh_ids:
+            continue                       # the first sweep already has it
+        ct = parse_zoho_time(t["createdTime"])
+        if ct > start_utc:
+            continue                       # created inside the window, already covered
+        if (t.get("statusType") or "") == "Closed":
+            closed += 1                    # only skip on an explicit Closed
+            continue
+        if ct < floor_utc:
+            too_old += 1
+            continue
+        if str(t.get("ticketNumber") or "") in already:
+            continue
+        late.append(t)
+    print("Modified since {:%Y-%m-%d %H:%M} IST: {}  -> {} late edit(s) to examine"
+          .format(mod_start.astimezone(IST), len(swept), len(late)))
+    # Printed every run so the bound stays visible rather than silently dropping work.
+    if too_old or closed:
+        print("  skipped: {} older than the {}-day lookback, {} closed".format(
+            too_old, lookback, closed))
+    if late:
+        print("  late edits: {}".format(
+            ", ".join("#" + str(t.get("ticketNumber")) for t in late[:12])))
+
+    if not tickets and not late:
         print("Nothing new - no file written.")
         return None
 
     print("Fetching custom fields...")
     with ThreadPoolExecutor(max_workers=5) as pool:
-        rows = list(pool.map(fetch_detail, tickets))
+        rows = list(pool.map(fetch_detail, tickets + late))
     rows.sort(key=lambda r: r["created_utc"])
 
-    # The watermark is the last ticket SEEN, before any filtering, so that
-    # non-logistics tickets at the tail are not re-scanned on every future run.
-    watermark = rows[-1]
+    # The created watermark is the last ticket SEEN by the FIRST sweep, before any
+    # filtering, so that non-logistics tickets at its tail are not re-scanned every
+    # run. Late-edit tickets must never set it: they are older than the window, so
+    # letting them would drag the watermark backwards and re-scan days of history.
+    created_rows = [r for r in rows if r["ticketId"] in fresh_ids]
+    if created_rows:
+        watermark = created_rows[-1]
+    else:
+        # Only late edits this time - hold the created watermark exactly where it was.
+        watermark = {"ticketNumber": state.get("last_ticket_number"),
+                     "created_utc": datetime.fromisoformat(state["last_created_utc"])}
 
     logistics = [r for r in rows if has_logistics_data(r)]
     print("Logistics tickets: {} of {} ({} = Logistics Team)".format(
@@ -641,7 +769,8 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     if not kept and not dropped:
         # Nothing to report and nothing to mail - a finished run, so commit.
         commit_run(state, watermark["ticketNumber"],
-                   watermark["created_utc"].isoformat(), None, 0, mailed=False)
+                   watermark["created_utc"].isoformat(), None, 0, mailed=False,
+                   modified_utc=modified_mark.isoformat() if modified_mark else None)
         print("No logistics tickets in window - watermark advanced, no file written.")
         return None
 
@@ -671,7 +800,8 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     save_registry(registry)
 
     # Held, not committed: the watermark only moves once the mail is away.
-    pending = start_pending(state, out, watermark)
+    pending = start_pending(state, out, watermark,
+                            modified_mark.isoformat() if modified_mark else None)
 
     print("\nSaved: {}".format(out))
     print("Rows : {}  (#{} -> #{})".format(
@@ -679,7 +809,8 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     print("State: watermark #{} held pending the mailer (attempt {})".format(
         watermark["ticketNumber"], pending["attempts"]))
     print("AWBs : {} tracked in {}".format(len(registry), AWB_FILE.name))
-    return {"path": out, "watermark": watermark}
+    return {"path": out, "watermark": watermark,
+            "modified_utc": modified_mark.isoformat() if modified_mark else None}
 
 
 # ============================================================================
@@ -2845,7 +2976,7 @@ def main():
         print("Mailed : yes (recorded before the run stopped) - not sending again")
         commit_run(state, pending["watermark_ticket"], pending["watermark_utc"],
                    pending.get("export_file"), int(pending.get("rows") or 0),
-                   mailed=True)
+                   mailed=True, modified_utc=pending.get("modified_utc"))
         state = load_state()
         pending = None
 
@@ -2880,7 +3011,8 @@ def main():
             print("Clear it with --abandon-pending, or restore the file.")
             return 1
         watermark = {"ticketNumber": pending["watermark_ticket"],
-                     "created_utc_iso": pending["watermark_utc"]}
+                     "created_utc_iso": pending["watermark_utc"],
+                     "modified_utc_iso": pending.get("modified_utc")}
     else:
         banner("PART 1/4  Zoho Desk - fetching logistics tickets")
         result = run_desk_fetch(state, force_today=flag("--today"),
@@ -2890,7 +3022,8 @@ def main():
             return 0
         tickets = result["path"]
         watermark = {"ticketNumber": result["watermark"]["ticketNumber"],
-                     "created_utc_iso": result["watermark"]["created_utc"].isoformat()}
+                     "created_utc_iso": result["watermark"]["created_utc"].isoformat(),
+                     "modified_utc_iso": result.get("modified_utc")}
 
     if tickets is None:
         print("\nNo export available - nothing to do.")
@@ -2939,7 +3072,8 @@ def main():
             print("\nNothing survived the Delivered/RTO filter - no mail to send.")
             if watermark:
                 commit_run(state, watermark["ticketNumber"],
-                           watermark["created_utc_iso"], tickets, 0, mailed=False)
+                           watermark["created_utc_iso"], tickets, 0, mailed=False,
+                           modified_utc=watermark.get("modified_utc_iso"))
                 # Committed, so no retry will ever want these files again.
                 cleanup_run_files([tickets, csv_path], keep=flag("--keep-files"))
             return 0
@@ -2982,7 +3116,8 @@ def main():
     names = [tickets.name, csv_path.name, merged.name, mapping.name]
     if watermark:
         commit_run(state, watermark["ticketNumber"], watermark["created_utc_iso"],
-                   tickets, rows, mailed=mailed)
+                   tickets, rows, mailed=mailed,
+                   modified_utc=watermark.get("modified_utc_iso"))
         # The mail is away and the watermark has moved: nothing will be retried, so
         # the day's working files go and tomorrow starts from an empty folder.
         cleanup_run_files([tickets, csv_path, merged, mapping],
