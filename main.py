@@ -2836,6 +2836,19 @@ def main():
 
     # ---- Part 1: Zoho Desk -------------------------------------------------
     pending = state.get("pending")
+    if pending and pending.get("mailer_sent"):
+        # The mail was accepted but the run died before the watermark moved. Re-sending
+        # would duplicate the escalation, and re-fetching from the old watermark would
+        # do the same, so finish that run's bookkeeping here and start today clean.
+        banner("Previous run mailed but never committed - closing it out")
+        print("Export : {}".format(pathlib.Path(pending["export_file"]).name))
+        print("Mailed : yes (recorded before the run stopped) - not sending again")
+        commit_run(state, pending["watermark_ticket"], pending["watermark_utc"],
+                   pending.get("export_file"), int(pending.get("rows") or 0),
+                   mailed=True)
+        state = load_state()
+        pending = None
+
     tickets = opt("--tickets")
     if tickets:
         tickets = pathlib.Path(tickets)
@@ -2955,6 +2968,14 @@ def main():
             print("\nMail did NOT go out. The watermark stays put, so the next run")
             print("re-processes these same tickets rather than skipping them.")
             return 1
+        # Persisted the moment SMTP accepts, BEFORE anything else can fail. If the
+        # process dies between here and commit_run, the next run has to know the mail
+        # already went out - otherwise it resumes the pending block and sends the
+        # courier a second copy of the same escalation.
+        if state.get("pending"):
+            state["pending"]["mailer_sent"] = True
+            state["pending"]["rows"] = rows
+            save_state(state)
         record_thread(message_id, "{} | {}".format(
             MAIL_SUBJECT, datetime.now(IST).strftime(SUBJECT_DATE_FMT)), ticket_map)
 
