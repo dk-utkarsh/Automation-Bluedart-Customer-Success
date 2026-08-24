@@ -1,0 +1,4 @@
+# Pinned to what the pipeline was verified against. Everything else it needs
+# (imaplib, smtplib, urllib, zipfile) is stdlib.
+selenium==4.41.0
+openpyxl==3.1.5

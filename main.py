@@ -59,9 +59,13 @@ import email
 import imaplib
 import io
 import json
+import os
 import pathlib
 import re
+import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -94,8 +98,28 @@ AWB_FILE = BASE / "awb_registry.json"
 THREADS_FILE = BASE / "threads.json"
 OUT = BASE / "output"
 PROFILE_DIR = BASE / ".chrome-profile"
-CHROME = pathlib.Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-DRIVER_CACHE = pathlib.Path.home() / ".cache" / "selenium" / "chromedriver" / "win64"
+IS_WINDOWS = os.name == "nt"
+
+# Chrome lives somewhere different on every platform, and on Linux the binary may be
+# called google-chrome, google-chrome-stable or chromium. These are searched in order;
+# CHROME_BINARY in .env overrides the search entirely. See chrome_path().
+CHROME_CANDIDATES = [
+    pathlib.Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+    pathlib.Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+] if IS_WINDOWS else [
+    pathlib.Path("/usr/bin/google-chrome"),
+    pathlib.Path("/usr/bin/google-chrome-stable"),
+    pathlib.Path("/opt/google/chrome/chrome"),
+    pathlib.Path("/usr/bin/chromium-browser"),
+    pathlib.Path("/usr/bin/chromium"),
+    pathlib.Path("/snap/bin/chromium"),
+]
+# chrome-for-testing publishes one build per platform, and the archive member is named
+# differently on each - both are needed to fetch and unpack the matching driver.
+DRIVER_PLATFORM = "win64" if IS_WINDOWS else "linux64"
+DRIVER_NAME = "chromedriver.exe" if IS_WINDOWS else "chromedriver"
+DRIVER_CACHE = (pathlib.Path.home() / ".cache" / "selenium" / "chromedriver"
+                / DRIVER_PLATFORM)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 PLACEHOLDER = "PASTE_VALUE_HERE"
@@ -866,30 +890,69 @@ DEBUG_PORT = 9222
 CLICKPOST_ENV = ["CLICKPOST_URL", "CLICKPOST_EMAIL", "CLICKPOST_PASSWORD"]
 
 
+def chrome_path():
+    """The Chrome binary to drive.
+
+    CHROME_BINARY in .env wins, so an unusual install needs no code change. Otherwise
+    the known locations for this platform are tried, then PATH."""
+    override = (ENV.get("CHROME_BINARY") or "").strip()
+    if override:
+        exe = pathlib.Path(override)
+        if not exe.exists():
+            raise SystemExit(
+                "CHROME_BINARY is set to {} but there is no such file".format(exe))
+        return exe
+    for cand in CHROME_CANDIDATES:
+        if cand.exists():
+            return cand
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return pathlib.Path(found)
+    raise SystemExit(
+        "Could not find Chrome. Install google-chrome-stable, or point CHROME_BINARY "
+        "in .env at the binary.")
+
+
 def chrome_version():
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "(Get-Item '{}').VersionInfo.ProductVersion".format(CHROME)],
-        capture_output=True, text=True)
-    v = out.stdout.strip()
+    """Product version of the Chrome that will actually be driven, e.g. 151.0.7922.170.
+
+    Windows has no --version flag that prints to stdout reliably, hence the PowerShell
+    property read; Linux does, so it is asked directly and the number pulled out of
+    "Google Chrome 151.0.7922.170"."""
+    exe = chrome_path()
+    if IS_WINDOWS:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-Item '{}').VersionInfo.ProductVersion".format(exe)],
+            capture_output=True, text=True)
+        v = out.stdout.strip()
+    else:
+        out = subprocess.run([str(exe), "--version"],
+                             capture_output=True, text=True)
+        found = re.search(r"(\d+\.\d+\.\d+\.\d+)", out.stdout or "")
+        v = found.group(1) if found else ""
     if not re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
-        raise SystemExit("Could not read Chrome version (got {!r})".format(v))
+        raise SystemExit(
+            "Could not read the Chrome version from {} (got {!r})".format(exe, v))
     return v
 
 
 def ensure_chromedriver(tries=5):
-    """Return a chromedriver.exe matching the installed Chrome, downloading if needed.
+    """Return a chromedriver matching the installed Chrome, downloading if needed.
 
     Selenium Manager cannot be relied on here - its downloader intermittently fails on
     this network and silently falls back to a CACHED, VERSION-MISMATCHED driver, which
     dies at launch with a confusing "only supports Chrome version N" error."""
     ver = chrome_version()
-    exe = DRIVER_CACHE / ver / "chromedriver.exe"
+    exe = DRIVER_CACHE / ver / DRIVER_NAME
     if exe.exists():
         return exe
 
     url = ("https://storage.googleapis.com/chrome-for-testing-public/"
-           "{}/win64/chromedriver-win64.zip".format(ver))
+           "{ver}/{plat}/chromedriver-{plat}.zip".format(
+               ver=ver, plat=DRIVER_PLATFORM))
     print("  chromedriver {} not cached - downloading".format(ver))
     blob = None
     for attempt in range(1, tries + 1):
@@ -906,9 +969,19 @@ def ensure_chromedriver(tries=5):
     exe.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
         for member in z.namelist():
-            if member.endswith("chromedriver.exe"):
+            # Exact basename, not endswith: the archive also carries
+            # LICENSE.chromedriver, which an endswith("chromedriver") test would
+            # happily extract as the driver on Linux.
+            if member.rsplit("/", 1)[-1] == DRIVER_NAME:
                 exe.write_bytes(z.read(member))
                 break
+    if not exe.exists():
+        raise SystemExit(
+            "{} was not found inside {}".format(DRIVER_NAME, url))
+    if not IS_WINDOWS:
+        # zipfile does not preserve the executable bit, so without this the driver
+        # fails to launch with a bare PermissionError that names no cause.
+        exe.chmod(exe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print("  installed {}".format(exe))
     return exe
 
@@ -916,14 +989,38 @@ def ensure_chromedriver(tries=5):
 def close_stale_chrome():
     """A previous detached run still holds .chrome-profile, and Chrome refuses to
     start a second instance on the same profile. Only processes launched against THIS
-    profile directory are closed - ordinary browsing windows are untouched."""
-    script = (
-        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*" + str(PROFILE_DIR) + "*' } | "
-        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }")
-    out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                         capture_output=True, text=True)
-    killed = [x for x in out.stdout.split() if x.strip().isdigit()]
+    profile directory are closed - ordinary browsing windows are untouched.
+
+    This matters more on a server than on a desktop: runs are detached on purpose so
+    the ClickPost session survives between them, so without a reaper a crashed run
+    would leave the profile locked and block every run after it."""
+    killed = []
+    if IS_WINDOWS:
+        script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+            "Where-Object { $_.CommandLine -like '*" + str(PROFILE_DIR) + "*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True)
+        killed = [x for x in out.stdout.split() if x.strip().isdigit()]
+    else:
+        # pgrep -f matches against the whole command line, which is the same
+        # "only processes holding OUR profile" test as the Windows branch.
+        try:
+            out = subprocess.run(["pgrep", "-f", str(PROFILE_DIR)],
+                                 capture_output=True, text=True)
+        except FileNotFoundError:
+            print("  note: pgrep not installed - cannot reap stale Chrome processes")
+            return
+        mine = os.getpid()
+        for tok in out.stdout.split():
+            if not tok.strip().isdigit() or int(tok) == mine:
+                continue
+            try:
+                os.kill(int(tok), signal.SIGKILL)
+                killed.append(tok)
+            except (ProcessLookupError, PermissionError):
+                pass
     if killed:
         print("  closed {} stale Chrome process(es) holding the profile".format(
             len(killed)))
@@ -949,6 +1046,15 @@ def start_browser(keep_open=True, headless=None):
         opts.add_argument("--disable-gpu")
     else:
         opts.add_argument("--start-maximized")
+    if not IS_WINDOWS:
+        # Both are required on a server. The sandbox needs privileges a service
+        # account does not have, and the default 64MB /dev/shm makes Chrome die
+        # part-way through a long report run.
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+    # Pinned explicitly so the driver launches the same binary chrome_version() was
+    # measured against - otherwise a second Chrome on PATH can cause a version clash.
+    opts.binary_location = str(chrome_path())
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     # Chrome offered to save these credentials on the first successful run, then
     # autofilled them on the next one - and the typed value landed on top of the
@@ -2021,11 +2127,15 @@ def thread_ticket_map(mapping_path):
         awb = norm_awb(r[awb_i])
         if not num:
             continue
+        # The registry is only trusted when its entry is for THIS ticket number.
+        # It is keyed by AWB, and an AWB can carry several tickets, so taking the id
+        # from an AWB hit alone could bind this row to a different ticket entirely.
         entry = registry.get(awb) or {}
-        tid = entry.get("ticketId")
+        tid = (entry.get("ticketId")
+               if str(entry.get("ticketNumber") or "") == num else None)
         if not tid:
             tid = resolve_ticket_id(num)
-            if tid and awb and awb in registry:
+            if tid and awb and str((registry.get(awb) or {}).get("ticketNumber") or "") == num:
                 registry[awb]["ticketId"] = tid
                 save_registry(registry)
         if not tid:
@@ -2283,11 +2393,10 @@ def thread_targets(thread):
 def locate_target(threads, current, row, registry):
     """Resolve one reply row to the ticket it belongs to.
 
-    TICKET NUMBER IS THE KEY. One AWB can have several tickets raised against it, so
-    matching on AWB alone can land a status on the wrong one; the ticket number is
-    unique and we put it in the mail precisely so it comes back.
-
-    AWB is only a fallback, for replies whose table has no ticket column.
+    THE TICKET NUMBER IS THE ONLY KEY. One AWB can have several tickets raised against
+    it, so resolving by AWB can land a status on the wrong ticket. A row that carries
+    no ticket number is therefore SKIPPED rather than guessed at - the ticket number is
+    unique and we put it in the mail precisely so that it comes back to us.
 
     Bluedart also answers on whichever mail is nearest to hand, so a reply to Monday's
     report routinely carries rows from Wednesday's. Every open thread is searched, and
@@ -2301,49 +2410,41 @@ def locate_target(threads, current, row, registry):
         return "this thread" if t is current else "thread {}".format(t.get("subject"))
 
     num = (row.get("ticket") or "").strip()
-    if num:
-        for t in order:
-            meta = thread_targets(t).get(num)
-            if meta:
-                return t, {"ticketNumber": num, "ticketId": meta.get("ticketId")}, where(t)
-        for awb, entry in registry.items():
-            if str(entry.get("ticketNumber") or "") == num:
-                tid = entry.get("ticketId") or resolve_ticket_id(num)
-                if tid:
-                    if not entry.get("ticketId"):
-                        entry["ticketId"] = tid
-                        save_registry(registry)
-                    return None, {"ticketNumber": num, "ticketId": tid}, "AWB registry"
-        tid = resolve_ticket_id(num)
-        if tid:
-            return None, {"ticketNumber": num, "ticketId": tid}, "Desk lookup"
+    if not num:
+        # Deliberately not falling back to the AWB - see the docstring.
+        return None, None, "no ticket number in the reply row"
 
-    awb = row.get("awb") or ""
-    if awb:
-        for t in order:
-            for tnum, meta in thread_targets(t).items():
-                if meta.get("awb") == awb:
-                    return t, {"ticketNumber": tnum,
-                               "ticketId": meta.get("ticketId")}, where(t) + " (by AWB)"
-        entry = registry.get(awb)
-        if entry:
-            tid = entry.get("ticketId")
-            if not tid and entry.get("ticketNumber"):
-                tid = resolve_ticket_id(entry["ticketNumber"])
-                if tid:
+    for t in order:
+        meta = thread_targets(t).get(num)
+        if meta:
+            return t, {"ticketNumber": num, "ticketId": meta.get("ticketId")}, where(t)
+
+    # The registry is keyed by AWB, but this is still a ticket-number lookup: it scans
+    # the entries for that number. The AWB is not what selects the ticket.
+    for awb, entry in registry.items():
+        if str(entry.get("ticketNumber") or "") == num:
+            tid = entry.get("ticketId") or resolve_ticket_id(num)
+            if tid:
+                if not entry.get("ticketId"):
                     entry["ticketId"] = tid
                     save_registry(registry)
-            if tid:
-                return None, {"ticketNumber": entry.get("ticketNumber"),
-                              "ticketId": tid}, "AWB registry (by AWB)"
+                return None, {"ticketNumber": num, "ticketId": tid}, "registry (by ticket no.)"
+
+    tid = resolve_ticket_id(num)
+    if tid:
+        return None, {"ticketNumber": num, "ticketId": tid}, "Desk lookup"
     return None, None, "unknown"
 
 
-def comment_on_ticket(ticket_id, awb, status, when):
-    """Private comment. isPublic false IS the Private button."""
-    content = ("Bluedart update ({date})\nAWB {awb}: {status}\n\n"
+def comment_on_ticket(ticket_id, ticket_number, status, when):
+    """Private comment. isPublic false IS the Private button.
+
+    Addressed AND labelled by the ticket alone. The AWB is deliberately kept out of
+    both: it is not unique, so naming it here would imply the update had been matched
+    on it, when the ticket number is what actually selected this ticket."""
+    content = ("Bluedart update ({date})\nTicket #{num}: {status}\n\n"
                "Added automatically from the escalation email reply."
-               ).format(date=when, awb=awb, status=status)
+               ).format(date=when, num=ticket_number, status=status)
     return api_post(COMMENT_PATH.format(ticket_id),
                     {"content": content, "isPublic": "false", "contentType": "plainText"})
 
@@ -2446,8 +2547,8 @@ def process_replies(verbose=True, dry=False):
                     awb, status = row.get("awb", ""), row["status"]
                     owner, target, via = locate_target(threads, thread, row, registry)
                     if not target or not target.get("ticketId"):
-                        print("    SKIP ticket {!r} / AWB {!r} - no matching ticket "
-                              "found".format(row.get("ticket"), awb))
+                        print("    SKIP ticket {!r} / AWB {!r} - {}".format(
+                            row.get("ticket"), awb, via))
                         continue
                     key = str(target["ticketNumber"])
                     # Keyed on the ticket number, not the AWB: one AWB can have
@@ -2467,7 +2568,7 @@ def process_replies(verbose=True, dry=False):
                         made += 1
                         continue
                     try:
-                        comment_on_ticket(target["ticketId"], awb or "-", status, when)
+                        comment_on_ticket(target["ticketId"], key, status, when)
                     except Exception as e:
                         print("    FAILED ticket {}: {}".format(key, e))
                         continue
@@ -2538,12 +2639,22 @@ def watch(poll_fallback=60):
             C = imap_connect()
             try:
                 C.select("INBOX")
-                print("[{:%H:%M:%S}] idle...".format(datetime.now(IST)))
-                with C.idle(duration=15 * 60) as idler:
-                    for typ, data in idler:
-                        if b"EXISTS" in bytes(str(data), "utf-8") or typ == "EXISTS":
-                            print("  new mail signalled")
-                            break
+                if hasattr(C, "idle"):
+                    print("[{:%H:%M:%S}] idle...".format(datetime.now(IST)))
+                    with C.idle(duration=15 * 60) as idler:
+                        for typ, data in idler:
+                            if b"EXISTS" in bytes(str(data), "utf-8") or typ == "EXISTS":
+                                print("  new mail signalled")
+                                break
+                else:
+                    # imaplib only grew IMAP4.idle() in Python 3.14. On an older
+                    # interpreter there is no push channel at all, so poll instead:
+                    # replies land a little later, nothing else about the loop changes.
+                    print("[{:%H:%M:%S}] polling every {}s "
+                          "(Python {}.{} has no IMAP IDLE)".format(
+                              datetime.now(IST), poll_fallback,
+                              sys.version_info[0], sys.version_info[1]))
+                    time.sleep(poll_fallback)
             finally:
                 try:
                     C.logout()

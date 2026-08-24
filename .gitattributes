@@ -1,0 +1,6 @@
+# This repo is edited on Windows and deployed on Linux.
+* text=auto
+
+# A systemd unit checked out with CRLF fails on Linux: the trailing \r becomes part
+# of the value, so ExecStart points at a path that does not exist. Force LF.
+*.service text eol=lf

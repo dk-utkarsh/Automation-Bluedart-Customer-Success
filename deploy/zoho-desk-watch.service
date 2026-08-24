@@ -1,0 +1,29 @@
+[Unit]
+Description=Zoho Desk escalation reply watcher (IMAP IDLE + 15:00 IST follow-ups)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zohodesk
+Group=zohodesk
+WorkingDirectory=/opt/zoho-desk
+ExecStart=/opt/zoho-desk/.venv/bin/python -u /opt/zoho-desk/main.py --watch
+
+# The loop swallows soft errors and retries on its own, but a hard crash would
+# otherwise leave replies unprocessed and the 15:00 follow-up unsent until someone
+# noticed. Restart unconditionally.
+Restart=always
+RestartSec=30
+
+# main.py stamps every time through an explicit IST constant, so the service
+# timezone does not affect the 15:00 follow-up rule. This only makes the journal
+# read in local time.
+Environment=TZ=Asia/Kolkata
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zoho-desk-watch
+
+[Install]
+WantedBy=multi-user.target
