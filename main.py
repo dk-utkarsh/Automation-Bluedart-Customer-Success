@@ -1336,11 +1336,15 @@ def clickpost_session():
     driver = attach()
     if driver is not None:
         try:
-            url = driver.current_url
-            if "/login" not in url:
-                print("Attached to the open ClickPost session -> {}".format(url))
-                return driver
-            print("Attached, but that window is signed out - logging in")
+            # Hand straight to clickpost_login(): it navigates to the login URL and
+            # treats a redirect AWAY from it as "already signed in", so it costs one
+            # page load when the session is live and logs in properly when it is not.
+            #
+            # Reading driver.current_url here instead would trust whatever the tab
+            # happens to be displaying, which may be a page rendered before the
+            # session expired. That produced a run that believed it was signed in,
+            # then failed further along with "Could not find 'Bulk Search'" - the
+            # session had lapsed and ClickPost had bounced it to /login.
             if clickpost_login(driver) == 0:
                 return driver
         except WebDriverException:
