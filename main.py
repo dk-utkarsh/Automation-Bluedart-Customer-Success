@@ -712,8 +712,24 @@ MAIL_ENV = ["OTP_EMAIL", "OTP_EMAIL_PASSWORD", "IMAP_HOST", "IMAP_PORT"]
 OTP_CONTEXT_RE = re.compile(
     r"one[\s-]*time\s*password|\botp\b|verification\s*code|security\s*code|passcode",
     re.IGNORECASE)
-ANCHORED_RE = re.compile(r"\bis\s*:?\s+([A-Z0-9]{4,8})\b")
+# Anchored forms: each pins the code to a label that precedes it, so the match is
+# positional and needs no digit. The scoped (?i:...) keeps the LABEL
+# case-insensitive while the captured code stays strictly [A-Z0-9] - a plain
+# re.IGNORECASE would relax the capture too and start matching lowercase prose.
+ANCHORED_RES = [
+    re.compile(r"\bis\s*:?\s+([A-Z0-9]{4,8})\b"),
+    re.compile(r"\b(?i:otp|code|passcode|password)\s*[:\-]\s*([A-Z0-9]{4,8})\b"),
+]
 CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z0-9]{4,8})(?![A-Za-z0-9])")
+# Words that legitimately appear in capitals inside OTP mails. Without this the
+# loose scan could return one of them as the "code" now that letters-only codes
+# are accepted.
+CODE_STOPWORDS = {
+    "OTP", "HTTP", "HTTPS", "HTML", "EMAIL", "LOGIN", "USER", "PASS", "CODE",
+    "PASSWORD", "PASSCODE", "VALID", "ONLY", "THIS", "YOUR", "PLEASE", "NOTE",
+    "TEAM", "INDIA", "TIME", "DEAR", "HELLO", "THANKS", "REPLY", "SHARE",
+    "NEVER", "MINUTES", "SECURITY", "VERIFY", "ACCOUNT", "SUPPORT", "NOREPLY",
+}
 YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 
 
@@ -726,10 +742,22 @@ def html_to_text(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _plausible_code(tok):
+def _plausible_code(tok, anchored=False):
+    """Could this token be the code?
+
+    A code may be ANY mix of letters and digits, letters-only included - ClickPost
+    issues those (KWUUHG, seen 2026-08-24). So a digit is never required. What is
+    rejected is only what cannot be a code: a bare year, and the handful of English
+    words that appear in capitals in these mails.
+
+    `anchored` says the token was pinned to a label ("... OTP is: X"), which makes
+    it trustworthy enough to skip the stopword check - a code legitimately spelling
+    one of those words should still win when the mail points straight at it."""
     if YEAR_RE.match(tok):
         return False
-    return any(c.isdigit() for c in tok)
+    if anchored:
+        return True
+    return tok.upper() not in CODE_STOPWORDS
 
 
 def extract_otp(text):
@@ -742,14 +770,19 @@ def extract_otp(text):
     if not OTP_CONTEXT_RE.search(flat):
         return None
 
-    m = ANCHORED_RE.search(flat)
-    if m and _plausible_code(m.group(1)):
-        return m.group(1)
+    for rx in ANCHORED_RES:
+        m = rx.search(flat)
+        if m and _plausible_code(m.group(1), anchored=True):
+            return m.group(1)
 
-    for tok in CANDIDATE_RE.findall(flat):
-        if _plausible_code(tok):
+    # Nothing was labelled, so fall back to scanning. Both shapes are accepted, but
+    # one carrying a digit is far less likely to be an ordinary word, so it wins if
+    # present; a letters-only token is still returned when that is all there is.
+    cands = [t for t in CANDIDATE_RE.findall(flat) if _plausible_code(t)]
+    for tok in cands:
+        if any(c.isdigit() for c in tok):
             return tok
-    return None
+    return cands[0] if cands else None
 
 
 def message_text(msg):
@@ -2689,6 +2722,13 @@ SELFTESTS = [
     ("real ClickPost OTP mail, second code",
      REAL_OTP_MAIL.replace("X63YUN", "W8BV3V"), "W8BV3V"),
     ("report mail yields nothing", REAL_REPORT_MAIL, None),
+    # 2026-08-24: a real code with no digits at all, which the old digit
+    # requirement silently rejected - the login then timed out with the mail
+    # sitting unread in the mailbox.
+    ("all-letter code (no digits)",
+     REAL_OTP_MAIL.replace("X63YUN", "KWUUHG"), "KWUUHG"),
+    ("all-letter code must not win without OTP context",
+     "Quarterly summary attached. Totals are FINAL and approved.", None),
     ("numeric OTP still works",
      "Your OTP for ClickPost login is: 483920. Valid for 10 minutes.", "483920"),
     ("verification code wording",
@@ -2700,6 +2740,19 @@ SELFTESTS = [
     ("no OTP context at all", "Your ClickPost report for Aug 19, 2026 is ready.", None),
     ("empty body", "", None),
     ("bare year rejected", "OTP mail 2026", None),
+    # A code may be any mix of letters and digits. These cover the shapes that the
+    # old digit requirement rejected, including the unanchored ones.
+    ("letters-only, labelled with a colon",
+     "ClickPost security code. Your OTP: MJXQVB", "MJXQVB"),
+    ("letters-only, no anchoring label at all",
+     "Your one-time password for ClickPost login, quoting reference MJXQVB below.",
+     "MJXQVB"),
+    ("letters-only wins over a capitalised English word",
+     "Your OTP was issued. Please LOGIN using MJXQVB now.", "MJXQVB"),
+    ("a token with a digit is preferred when both are present",
+     "Your OTP details. Reference ABCDEF, code 4KJ2QP.", "4KJ2QP"),
+    ("digits-only still works unanchored",
+     "Your one-time password, reference 481920 for this login.", "481920"),
 ]
 
 
