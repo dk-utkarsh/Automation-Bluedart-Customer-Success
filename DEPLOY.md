@@ -111,7 +111,21 @@ day's report rather than duplicating it, and the AWB registry stops a ticket bei
 chased twice.
 
 **Reply watcher.** Run this as a service rather than from cron — it is a long-lived
-loop, not a periodic job. It also applies the 15:00 IST follow-up.
+loop, not a periodic job. It also sends both kinds of follow-up, so no extra cron
+entry is needed: each wake (IDLE caps below 29 minutes) re-checks what is due.
+
+Two chase rules, and a thread is only ever eligible for one of them:
+
+| Thread | Rule |
+|---|---|
+| Bluedart has never replied | one nudge at 15:00 IST the day after the report |
+| Bluedart replied, but some AWBs are not yet delivered | chased every 15h on the same trail, from when each reply landed, up to 10 times |
+
+An AWB leaves the chase when its remark is final — "delivered" anywhere in the text
+(so `RTO Delivered` counts), except where it is negated: `Undelivered`,
+`Not delivered` and `Could not be delivered` all stay pending. Set
+`"followup_suppressed": true` on a thread in `threads.json` to stop both rules for
+it by hand.
 
 ```bash
 sudo cp deploy/zoho-desk-watch.service /etc/systemd/system/
@@ -122,7 +136,9 @@ journalctl -u zoho-desk-watch -f
 
 **Note before first start:** any thread still `awaiting_reply` whose follow-up is
 already overdue fires the moment the watcher comes up — the rule is `now >= due`, with
-no upper bound. Check `threads.json` first if that would send unwanted mail.
+no upper bound. This now applies to the 15-hour chase too, so a thread carrying an old
+reply can send immediately. Check `threads.json` first if that would send unwanted
+mail, and suppress anything you do not want chased.
 
 ## 7. Log directory
 

@@ -76,7 +76,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.header import decode_header, make_header
-from email.utils import make_msgid
+from email.utils import make_msgid, parsedate_to_datetime
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -2272,6 +2272,35 @@ FOLLOWUP_HOUR = 15            # 15:00 IST the day after, if still no reply
 FOLLOWUP_TEXT = "Hi, please revert as soon as possible."
 COMMENT_PATH = "tickets/{}/comments"
 
+REPLY_FOLLOWUP_HOURS = 15     # chase again this long after a reply lands
+FOLLOWUP_MAX_ROUNDS = 10      # ~6 days of chasing, then leave the thread alone
+
+# "Undelivered" and "Not delivered" both CONTAIN "delivered". A plain substring
+# test would read either as final and abandon a live shipment forever, so the
+# negations are matched first and win. The gap allows "not yet delivered" and
+# "could not be delivered" without swallowing a whole sentence.
+_UNDELIVERED = re.compile(r"\bun-?delivered\b")
+_NEGATED = re.compile(r"\b(not|never|no|cannot|couldn'?t|could not|unable|fail\w*)"
+                      r"[\w\s,'-]{0,24}\bdelivered\b")
+
+
+def is_final_status(text):
+    """True when this remark means the AWB needs no further chasing.
+
+    Final is "delivered" anywhere in the remark, minus negations, plus anything
+    RTO-prefixed - which matches the ClickPost filter's reasoning that a shipment
+    already heading back needs no chasing either."""
+    t = " ".join(str(text or "").split()).lower()
+    if not t:
+        return False
+    if _UNDELIVERED.search(t):
+        return False
+    if _NEGATED.search(t):
+        return False
+    if "delivered" in t:
+        return True
+    return t.replace(" ", "").startswith("rto")
+
 
 def thread_ticket_map(mapping_path):
     """{ticketNumber: {"ticketId", "awb"}} for the mail just sent.
@@ -2558,6 +2587,18 @@ def thread_targets(thread):
     return out
 
 
+def pending_targets(thread):
+    """{ticketNumber: meta} for the lines on this thread still worth chasing.
+
+    A line drops out only once its remark was FINAL. Being answered is not the
+    same as being finished - "OFD" is an answer and still needs chasing, which is
+    the entire point of this cycle. Keeping the two apart is why finality is
+    tracked in its own dict rather than reusing `processed`."""
+    final = thread.get("final") or {}
+    return {num: meta for num, meta in thread_targets(thread).items()
+            if num not in final}
+
+
 def locate_target(threads, current, row, registry):
     """Resolve one reply row to the ticket it belongs to.
 
@@ -2617,6 +2658,39 @@ def comment_on_ticket(ticket_id, ticket_number, status, when):
                     {"content": content, "isPublic": "false", "contentType": "plainText"})
 
 
+def followup_body(thread):
+    """(text, html) for a chase naming only the AWBs still not delivered.
+
+    Ticket Number leads the table because a reply carrying it back resolves on the
+    ticket alone - the AWB is a guarded last resort, never the key. The remark
+    Bluedart last gave is echoed so they can see what they told us without
+    scrolling the trail.
+
+    The columns are thinner than the original mapping mail: a sent thread persists
+    only the ticket number and the AWB, so courier, EDD and the rest cannot be
+    rebuilt here."""
+    pending = pending_targets(thread)
+    book = thread.get("processed") or {}
+    rows = [(num, pending[num].get("awb") or "-",
+             (book.get(num) or {}).get("status") or "-")
+            for num in sorted(pending)]
+
+    text = "{}\n\n{}\n".format(FOLLOWUP_TEXT, "\n".join(
+        "Ticket {}  |  AWB {}  |  last update: {}".format(*r) for r in rows))
+
+    html = (
+        '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;'
+        'color:#000000;"><p>{}</p>'
+        '<table cellpadding="6" cellspacing="0" border="1" '
+        'style="border-collapse:collapse;font-size:13px;">'
+        '<tr style="background:#f2f2f2;"><th>Ticket Number</th>'
+        '<th>AWB Number</th><th>Last update from you</th></tr>{}</table></div>'
+    ).format(_esc(FOLLOWUP_TEXT), "".join(
+        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            _esc(a), _esc(b), _esc(c)) for a, b, c in rows))
+    return text, html
+
+
 def send_followup(thread):
     """Chase on the same thread, so it lands in the existing conversation."""
     import smtplib
@@ -2634,10 +2708,9 @@ def send_followup(thread):
     msg["Subject"] = "Re: " + thread["subject"]
     msg["In-Reply-To"] = thread["message_id"]
     msg["References"] = thread["message_id"]
-    msg.set_content("{}\n".format(FOLLOWUP_TEXT))
-    msg.add_alternative(
-        '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;'
-        'color:#000000;"><p>{}</p></div>'.format(_esc(FOLLOWUP_TEXT)), subtype="html")
+    text, html = followup_body(thread)
+    msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
     try:
         with smtplib.SMTP(ENV["SMTP_HOST"], int(ENV["SMTP_PORT"]), timeout=60) as s:
             s.starttls()
@@ -2650,8 +2723,62 @@ def send_followup(thread):
         return False
 
 
+def reply_received_at(msg):
+    """When Bluedart's reply landed in our mailbox.
+
+    The Date header is what the requirement means by "received". The 15-hour clock
+    hangs off it rather than off when this run happened to read the mail, so a run
+    delayed by an outage does not stretch the interval to match."""
+    try:
+        d = parsedate_to_datetime(msg.get("Date"))
+        if d is not None:
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=IST)
+            return d.astimezone(IST)
+    except Exception:
+        pass
+    return datetime.now(IST)
+
+
+def arm_followup(thread, received):
+    """Point the next chase at 15 hours after this reply landed.
+
+    Disarmed once nothing is pending or the cap is hit, so a finished or exhausted
+    thread cannot be woken up again by reply_followup_due."""
+    thread["last_reply_ist"] = received.isoformat()
+    if (pending_targets(thread)
+            and int(thread.get("followup_round") or 0) < FOLLOWUP_MAX_ROUNDS):
+        thread["next_followup_ist"] = (
+            received + timedelta(hours=REPLY_FOLLOWUP_HOURS)).isoformat()
+    else:
+        thread["next_followup_ist"] = None
+
+
+def reply_followup_due(thread, now=None):
+    """True when the 15-hour reply-anchored chase is ready to go out.
+
+    Armed only by an actual reply landing, so a thread Bluedart has never answered
+    is left to the 15:00 net below instead of being chased by both mechanisms."""
+    if thread.get("followup_suppressed"):
+        return False
+    nxt = thread.get("next_followup_ist")
+    if not nxt:
+        return False
+    if int(thread.get("followup_round") or 0) >= FOLLOWUP_MAX_ROUNDS:
+        return False
+    if not pending_targets(thread):
+        return False
+    return (now or datetime.now(IST)) >= datetime.fromisoformat(nxt)
+
+
 def followup_due(thread, now=None):
-    """True once it is past FOLLOWUP_HOUR on the day AFTER the report went out."""
+    """True once it is past FOLLOWUP_HOUR on the day AFTER the report went out.
+
+    The no-reply safety net, and nothing more. Once Bluedart has answered even
+    once, the 15-hour cycle owns the thread and this rule steps aside - otherwise
+    a thread mid-cycle would be chased by both."""
+    if thread.get("followup_suppressed") or thread.get("last_reply_ist"):
+        return False
     if thread.get("status") != "awaiting_reply" or thread.get("followup_sent_ist"):
         return False
     now = now or datetime.now(IST)
@@ -2710,7 +2837,9 @@ def process_replies(verbose=True, dry=False):
                         print("    no Status table found - skipped, thread left open")
                     continue
 
-                when = datetime.now(IST).strftime(MAIL_DATE_FMT)
+                received = reply_received_at(msg)
+                when = received.strftime(MAIL_DATE_FMT)
+                touched = []
                 for row in statuses:
                     awb, status = row.get("awb", ""), row["status"]
                     owner, target, via = locate_target(threads, thread, row, registry)
@@ -2723,9 +2852,15 @@ def process_replies(verbose=True, dry=False):
                     # several tickets, so an AWB key would collapse them into one.
                     # Booked against the thread that owns the ticket, so that report
                     # closes properly and cannot comment the same ticket twice.
-                    book = (owner or thread).setdefault("processed", {})
-                    if key in book and not dry:
-                        continue
+                    home = owner or thread
+                    book = home.setdefault("processed", {})
+                    final = home.setdefault("final", {})
+                    # EVERY remark is commented, including the second and third on a
+                    # ticket already answered: "OFD" -> "Under follow up" ->
+                    # "Delivered" is the normal progression and the ticket has to
+                    # carry all of it. Re-reading the same reply is prevented by
+                    # seen_replies above, which is the right dedup key - one per
+                    # reply, not one per ticket for all time.
                     if owner is not thread:
                         print("    note: ticket #{} belongs to {}".format(key, via))
                     if dry:
@@ -2742,8 +2877,21 @@ def process_replies(verbose=True, dry=False):
                         continue
                     book[key] = {"status": status, "awb": awb, "via": via,
                                  "commented_ist": datetime.now(IST).isoformat()}
+                    # Finality is recorded once and never lifted: a later non-final
+                    # remark on a delivered AWB is still commented, but must not
+                    # drag it back into the chase.
+                    if key not in final and is_final_status(status):
+                        final[key] = {"status": status, "awb": awb,
+                                      "finalised_ist": received.isoformat()}
+                        print("    #{} is final ({!r}) - no further chasing".format(
+                            key, status))
+                    if home not in touched:
+                        touched.append(home)
                     made += 1
                     print("    #{} <- {!r}  (AWB {})".format(key, status, awb or "-"))
+                if not dry:
+                    for home in touched:
+                        arm_followup(home, received)
                 seen.append(rid)
 
         # Completion is judged across ALL threads, not just the one being read: a
@@ -2752,18 +2900,20 @@ def process_replies(verbose=True, dry=False):
         for t in threads:
             if t.get("status") != "awaiting_reply":
                 continue
-            done = t.get("processed") or {}
-            outstanding = [n for n in thread_targets(t) if n not in done]
-            if done and not outstanding:
+            answered = t.get("processed") or {}
+            # Outstanding means NOT DELIVERED, not merely "not yet answered". An AWB
+            # answered "OFD" is answered and still outstanding - closing the thread
+            # on it is exactly the bug this cycle exists to fix.
+            outstanding = sorted(pending_targets(t))
+            if answered and not outstanding:
                 if not dry:
                     t["status"] = "completed"
                     t["completed_ist"] = datetime.now(IST).isoformat()
-                print("  thread completed ({}): all {} AWB(s) updated".format(
-                    t.get("subject"), len(done)))
-            elif done:
-                # Partial reply: answered AWBs are done, the rest keep the thread open
-                # so they are still chased rather than quietly abandoned.
-                print("  thread still open ({}): {} AWB(s) unanswered: {}".format(
+                    t["next_followup_ist"] = None
+                print("  thread completed ({}): all {} AWB(s) delivered".format(
+                    t.get("subject"), len(thread_targets(t))))
+            elif answered:
+                print("  thread still open ({}): {} AWB(s) not delivered: {}".format(
                     t.get("subject"), len(outstanding), ", ".join(outstanding)))
     finally:
         try:
@@ -2775,14 +2925,40 @@ def process_replies(verbose=True, dry=False):
     return made
 
 
-def run_followups(verbose=True):
-    """Send the 15:00 nudge on any thread that has gone quiet. One per thread."""
+def run_followups(verbose=True, now=None):
+    """Send whatever chases are due, by either mechanism.
+
+    Two independent rules, and a thread is only ever eligible for one of them:
+
+      * the 15-hour reply-anchored cycle, for a thread Bluedart HAS answered but
+        which still has AWBs short of a delivered status;
+      * the 15:00 next-day nudge, for a thread Bluedart has NEVER answered.
+
+    The cycle re-arms itself on send rather than only on reply, so a thread that
+    goes quiet after one answer keeps being chased instead of stalling with AWBs
+    still open. At the cap it disarms and is left alone."""
     threads = load_threads()
+    now = now or datetime.now(IST)
     sent = 0
     for thread in threads:
-        if followup_due(thread):
+        if reply_followup_due(thread, now):
+            if not send_followup(thread):
+                continue                  # left armed in the past; retried next tick
+            thread["followup_round"] = int(thread.get("followup_round") or 0) + 1
+            thread["followup_sent_ist"] = now.isoformat()
+            if thread["followup_round"] >= FOLLOWUP_MAX_ROUNDS:
+                thread["next_followup_ist"] = None
+                thread["stalled_ist"] = now.isoformat()
+                print("  {} chases with no delivered status - leaving {} alone: "
+                      "{}".format(FOLLOWUP_MAX_ROUNDS, thread.get("subject"),
+                                  ", ".join(sorted(pending_targets(thread)))))
+            else:
+                thread["next_followup_ist"] = (
+                    now + timedelta(hours=REPLY_FOLLOWUP_HOURS)).isoformat()
+            sent += 1
+        elif followup_due(thread, now):
             if send_followup(thread):
-                thread["followup_sent_ist"] = datetime.now(IST).isoformat()
+                thread["followup_sent_ist"] = now.isoformat()
                 sent += 1
     if sent:
         save_threads(threads)
@@ -2798,7 +2974,11 @@ def watch(poll_fallback=60):
     public webhook endpoint. The IDLE window is capped below the 29-minute protocol
     limit; each wake also re-checks whether a follow-up has come due."""
     print("Watching for replies. Ctrl+C to stop.")
-    print("  follow-up fires at {:02d}:00 IST the day after a report".format(FOLLOWUP_HOUR))
+    print("  never answered: one nudge at {:02d}:00 IST the day after a report"
+          .format(FOLLOWUP_HOUR))
+    print("  answered, still not delivered: chased every {}h on the same "
+          "trail, up to {} times".format(REPLY_FOLLOWUP_HOURS,
+                                         FOLLOWUP_MAX_ROUNDS))
     while True:
         try:
             process_replies(verbose=True)
