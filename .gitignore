@@ -17,3 +17,6 @@ __pycache__/
 
 # Local pre-change copies of main.py - git history is the real backup.
 *.bak-*
+
+# Test-run logs. May contain ticket numbers; never committed.
+*.log
