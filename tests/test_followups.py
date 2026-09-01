@@ -158,6 +158,104 @@ check("a thread with no reply yet chases everything",
       "123445" in never and "2233445" in never, True)
 
 
+# --------------------------------------------- the interval is configurable
+# 15 hours is the production cadence. A test run needs to chase immediately
+# rather than wait it out, so .env may override it - but ONLY .env, and the
+# default must stay 15 so production cannot drift by accident.
+print("followup_interval_hours:")
+m.ENV = {}
+check("with nothing set, production's 15h stands",
+      m.followup_interval_hours(), 15)
+m.ENV = {"REPLY_FOLLOWUP_HOURS": "0"}
+check("0 means chase immediately", m.followup_interval_hours(), 0)
+m.ENV = {"REPLY_FOLLOWUP_HOURS": "0.5"}
+check("fractional hours allowed", m.followup_interval_hours(), 0.5)
+m.ENV = {"REPLY_FOLLOWUP_HOURS": ""}
+check("blank falls back to 15", m.followup_interval_hours(), 15)
+m.ENV = {"REPLY_FOLLOWUP_HOURS": "not-a-number"}
+check("garbage falls back to 15, never crashes", m.followup_interval_hours(), 15)
+m.ENV = {"REPLY_FOLLOWUP_HOURS": "-3"}
+check("negative is clamped to 0, never sends into the past",
+      m.followup_interval_hours(), 0)
+
+print("arm_followup honours it:")
+m.ENV = {}
+t = mkthread(MIXED)
+m.arm_followup(t, T0)
+check("default arms 15h after the reply", t["next_followup_ist"],
+      (T0 + timedelta(hours=15)).isoformat())
+m.ENV = {"REPLY_FOLLOWUP_HOURS": "0"}
+t = mkthread(MIXED)
+m.arm_followup(t, T0)
+check("override arms at the reply time itself", t["next_followup_ist"],
+      T0.isoformat())
+check("and is therefore due at once", m.reply_followup_due(t, now=T0), True)
+m.ENV = {}
+
+
+# ------------------------------- our own mail must never look like a reply
+# Bluedart quotes our follow-up when they answer. If our own table parses as a
+# status table, a bare "will update you" is read as a fresh status, the pause
+# never engages, and the chase re-arms off our own words - a loop that mails
+# them every cycle forever.
+sent_html = m.followup_body(mkthread(MIXED))[1]
+check("our follow-up table is NOT a status table",
+      m.parse_status_table(sent_html), [])
+
+# but the moment Bluedart appends a status to it, it must parse
+answered = sent_html.replace("<th>AWB Number</th>",
+                             "<th>AWB Number</th><th>Status</th>")
+answered = answered.replace("<td>998736</td>", "<td>998736</td><td>Delivered</td>")
+rows = m.parse_status_table(answered)
+check("the same table WITH a status column does parse", len(rows), 1)
+check("and carries their remark", rows[0]["status"] if rows else None, "Delivered")
+check("keyed on the ticket number", rows[0]["ticket"] if rows else None, "1003")
+
+
+# ------------------- the chase reuses the FULL mapping table, minus delivered
+FULL_COLS = ["Ticket Number", "AWB Number", "Vinc Shipment EDD", "Delay Days",
+             "Concern Type", "Courier Partner", "State"]
+
+
+def full_thread(statuses, cols=None, extra_cell=None):
+    """A thread that persisted the whole mapping row, as a real send now does."""
+    t = mkthread(statuses)
+    t["columns"] = list(cols or FULL_COLS)
+    for num, meta in t["tickets"].items():
+        row = [num, meta["awb"], "2026-08-23", "2", "Fake NDR", "Bluedart",
+               "Gujarat"]
+        if extra_cell is not None:
+            row.append(extra_cell)
+        meta["row"] = row
+    return t
+
+
+ht = m.followup_body(full_thread(MIXED))[1]
+print("followup_body - full mapping format:")
+for col in FULL_COLS:
+    check("column {!r} is kept".format(col), col in ht, True)
+check("pending row's values are there",
+      "Fake NDR" in ht and "Bluedart" in ht and "Gujarat" in ht, True)
+check("delay days kept", ">2<" in ht.replace(" ", ""), True)
+check("the EDD is kept", "2026-08-23" in ht, True)
+check("the pending AWB is named", "998736" in ht, True)
+check("the DELIVERED rows are gone", "123445" in ht or "2233445" in ht, False)
+check("our own chase still never parses as a status table",
+      m.parse_status_table(ht), [])
+
+# a Status column in the source must never be echoed back - that is the loop
+loop = m.followup_body(full_thread(MIXED, cols=FULL_COLS + ["Status"],
+                                   extra_cell="OFD"))[1]
+print("a Status column in the mapping is dropped, not echoed:")
+check("no Status header in what we send", "<th>Status</th>" in loop, False)
+check("and it still does not parse as a reply", m.parse_status_table(loop), [])
+
+print("older threads without the stored row still work:")
+old = m.followup_body(mkthread(MIXED))[1]
+check("falls back to ticket + AWB", "998736" in old and "1003" in old, True)
+check("and is still parser-safe", m.parse_status_table(old), [])
+
+
 print()
 if FAILED:
     print("{} FAILURE(S)".format(len(FAILED)))

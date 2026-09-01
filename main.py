@@ -2303,7 +2303,7 @@ def is_final_status(text):
 
 
 def thread_ticket_map(mapping_path):
-    """{ticketNumber: {"ticketId", "awb"}} for the mail just sent.
+    """(header, {ticketNumber: {"ticketId", "awb", "row"}}) for the mail just sent.
 
     Keyed on the ticket number because that is the unique identifier - the same AWB
     can carry more than one ticket, so an AWB-keyed map would silently lose one.
@@ -2338,17 +2338,23 @@ def thread_ticket_map(mapping_path):
         if not tid:
             print("  warning: no ticket id for #{} - a reply for it cannot be "
                   "commented".format(num))
-        out[num] = {"ticketId": tid, "awb": awb}
-    return out
+        # The whole row is kept, not just the ids: Mapping.xlsx is deleted when
+        # the run commits, so this is the only surviving copy of the courier,
+        # EDD and concern columns - and the chase re-sends them unchanged.
+        out[num] = {"ticketId": tid, "awb": awb, "row": list(r)}
+    return header, out
 
 
-def record_thread(message_id, subject, ticket_map):
+def record_thread(message_id, subject, ticket_map, columns=None):
     threads = load_threads()
     threads.append({
         "message_id": message_id,
         "subject": subject,
         "sent_ist": datetime.now(IST).isoformat(),
         "tickets": ticket_map,
+        # The mapping header, so a chase can rebuild the same table we escalated
+        # with rather than a reduced one.
+        "columns": list(columns or []),
         "status": "awaiting_reply",
         "followup_sent_ist": None,
         "processed": {},
@@ -2661,33 +2667,57 @@ def comment_on_ticket(ticket_id, ticket_number, status, when):
 def followup_body(thread):
     """(text, html) for a chase naming only the AWBs still not delivered.
 
-    Ticket Number leads the table because a reply carrying it back resolves on the
-    ticket alone - the AWB is a guarded last resort, never the key. The remark
-    Bluedart last gave is echoed so they can see what they told us without
-    scrolling the trail.
+    The table is the SAME shape we escalated with - every mapping column, in the
+    same order - so the trail reads as one conversation and Bluedart can answer
+    the chase exactly as they answered the first mail. Only the rows that reached
+    a delivered status are dropped.
 
-    The columns are thinner than the original mapping mail: a sent thread persists
-    only the ticket number and the AWB, so courier, EDD and the rest cannot be
-    rebuilt here."""
+    Any status-like column is stripped from what we send, however it reached the
+    mapping. parse_status_table reads "our own headers plus one extra column" as
+    a filled-in reply, so echoing a status column back would make our own chase
+    parse as a Bluedart status the moment they quote it - posting a comment,
+    re-arming the timer off our own words, and chasing forever. The status column
+    is theirs to add, never ours to send.
+
+    Threads recorded before the mapping row was persisted have no `columns`; they
+    fall back to ticket number and AWB, which is all such a thread ever stored."""
     pending = pending_targets(thread)
     book = thread.get("processed") or {}
-    rows = [(num, pending[num].get("awb") or "-",
-             (book.get(num) or {}).get("status") or "-")
-            for num in sorted(pending)]
+    order = sorted(pending)
+
+    cols = list(thread.get("columns") or [])
+    grid = [list(pending[num].get("row") or []) for num in order]
+
+    if cols and grid and all(len(g) == len(cols) for g in grid):
+        drop = _status_index(cols)
+        if drop is not None:
+            cols = [c for i, c in enumerate(cols) if i != drop]
+            grid = [[v for i, v in enumerate(g) if i != drop] for g in grid]
+    else:
+        cols = ["Ticket Number", "AWB Number"]
+        grid = [[num, pending[num].get("awb") or "-"] for num in order]
 
     text = "{}\n\n{}\n".format(FOLLOWUP_TEXT, "\n".join(
-        "Ticket {}  |  AWB {}  |  last update: {}".format(*r) for r in rows))
+        ["  |  ".join(cols)] +
+        ["  |  ".join("" if v is None else str(v) for v in g) for g in grid]))
 
+    # The remark they last gave goes in prose, not in a column: a cell would
+    # rebuild the very shape that made our own mail parse as a reply.
+    echoed = ["#{} - {}".format(_esc(num), _esc((book.get(num) or {}).get("status")))
+              for num in order if (book.get(num) or {}).get("status")]
     html = (
         '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;'
         'color:#000000;"><p>{}</p>'
         '<table cellpadding="6" cellspacing="0" border="1" '
         'style="border-collapse:collapse;font-size:13px;">'
-        '<tr style="background:#f2f2f2;"><th>Ticket Number</th>'
-        '<th>AWB Number</th><th>Last update from you</th></tr>{}</table></div>'
-    ).format(_esc(FOLLOWUP_TEXT), "".join(
-        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-            _esc(a), _esc(b), _esc(c)) for a, b, c in rows))
+        '<tr style="background:#f2f2f2;">{}</tr>{}</table>{}</div>'
+    ).format(
+        _esc(FOLLOWUP_TEXT),
+        "".join("<th>{}</th>".format(_esc(c)) for c in cols),
+        "".join("<tr>{}</tr>".format(
+            "".join("<td>{}</td>".format(_esc("" if v is None else str(v)))
+                    for v in g)) for g in grid),
+        "<p>Your last update: {}.</p>".format("; ".join(echoed)) if echoed else "")
     return text, html
 
 
@@ -2740,16 +2770,51 @@ def reply_received_at(msg):
     return datetime.now(IST)
 
 
+def followup_interval_hours():
+    """Hours to wait after a reply before chasing again.
+
+    REPLY_FOLLOWUP_HOURS is the production cadence and the default. A test run
+    sets REPLY_FOLLOWUP_HOURS=0 in .env to chase at once rather than sit out the
+    real interval. Anything unparseable falls back to the default rather than
+    raising, so a fat-fingered .env cannot stop the pipeline chasing; a negative
+    is clamped to 0 so a chase is never armed into the past."""
+    raw = str((ENV or {}).get("REPLY_FOLLOWUP_HOURS") or "").strip()
+    if not raw:
+        return REPLY_FOLLOWUP_HOURS
+    try:
+        return max(0, float(raw))
+    except ValueError:
+        print("  warning: REPLY_FOLLOWUP_HOURS={!r} is not a number - "
+              "using {}h".format(raw, REPLY_FOLLOWUP_HOURS))
+        return REPLY_FOLLOWUP_HOURS
+
+
+def pause_followups(thread, received):
+    """Bluedart answered, but not with a status. Stand the chase down.
+
+    Chasing someone who has just written to us reads as though we ignored them,
+    and their next mail is usually the real status. So a reply carrying no status
+    table PAUSES the cycle rather than leaving the old timer to fire: nothing more
+    is sent until a reply that actually carries a table re-arms it.
+
+    The 15:00 no-reply net stands down too, because last_reply_ist is now set -
+    Bluedart has replied, whatever the content."""
+    thread["last_reply_ist"] = received.isoformat()
+    thread["next_followup_ist"] = None
+    thread["awaiting_status_since"] = received.isoformat()
+
+
 def arm_followup(thread, received):
     """Point the next chase at 15 hours after this reply landed.
 
     Disarmed once nothing is pending or the cap is hit, so a finished or exhausted
     thread cannot be woken up again by reply_followup_due."""
     thread["last_reply_ist"] = received.isoformat()
+    thread["awaiting_status_since"] = None      # a real status lifts the pause
     if (pending_targets(thread)
             and int(thread.get("followup_round") or 0) < FOLLOWUP_MAX_ROUNDS):
         thread["next_followup_ist"] = (
-            received + timedelta(hours=REPLY_FOLLOWUP_HOURS)).isoformat()
+            received + timedelta(hours=followup_interval_hours())).isoformat()
     else:
         thread["next_followup_ist"] = None
 
@@ -2832,12 +2897,18 @@ def process_replies(verbose=True, dry=False):
                 if verbose:
                     print("  reply from {} - {} status row(s)".format(
                         msg.get("From"), len(statuses)))
+                received = reply_received_at(msg)
                 if not statuses:
+                    # Not nothing: they answered. Pause and wait for the status
+                    # rather than letting the previous timer chase them anyway.
                     if verbose:
-                        print("    no Status table found - skipped, thread left open")
+                        print("    no Status table - they have replied but not with "
+                              "a status; chase paused until they send one")
+                    if not dry:
+                        pause_followups(thread, received)
+                        seen.append(rid)
                     continue
 
-                received = reply_received_at(msg)
                 when = received.strftime(MAIL_DATE_FMT)
                 touched = []
                 done_this_reply = set()
@@ -2963,7 +3034,7 @@ def run_followups(verbose=True, now=None):
                                   ", ".join(sorted(pending_targets(thread)))))
             else:
                 thread["next_followup_ist"] = (
-                    now + timedelta(hours=REPLY_FOLLOWUP_HOURS)).isoformat()
+                    now + timedelta(hours=followup_interval_hours())).isoformat()
             sent += 1
         elif followup_due(thread, now):
             if send_followup(thread):
@@ -3284,7 +3355,7 @@ def main():
         mailed = False
     else:
         # Recorded BEFORE cleanup deletes Mapping.xlsx, since the map is read from it.
-        ticket_map = thread_ticket_map(mapping)
+        columns, ticket_map = thread_ticket_map(mapping)
         message_id = send_mapping_mail(mapping, rows)
         mailed = bool(message_id)
         if not mailed:
@@ -3300,7 +3371,8 @@ def main():
             state["pending"]["rows"] = rows
             save_state(state)
         record_thread(message_id, "{} | {}".format(
-            MAIL_SUBJECT, datetime.now(IST).strftime(SUBJECT_DATE_FMT)), ticket_map)
+            MAIL_SUBJECT, datetime.now(IST).strftime(SUBJECT_DATE_FMT)),
+            ticket_map, columns)
 
     names = [tickets.name, csv_path.name, merged.name, mapping.name]
     if watermark:

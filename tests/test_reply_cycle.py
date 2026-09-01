@@ -248,6 +248,78 @@ check("commented once, not twice", len(COMMENTS), 1)
 check("and it is still pending", sorted(m.pending_targets(only())), ["3001"])
 
 
+# ========================= a conversational reply PAUSES the chase
+# Bluedart answering "we will update you" is an answer, even though it carries
+# no status. Chasing them 15h later regardless reads as if we ignored them.
+# The cycle must stand down and wait for a reply that actually carries a table.
+from email.message import EmailMessage
+
+
+def plain_reply(mid, when, text):
+    msg = EmailMessage()
+    msg["From"] = "rahul@bluedart.com"
+    msg["To"] = "escalations@dentalkart.com"
+    msg["Subject"] = "Re: Bluedart escalation 06 Sep"
+    msg["Message-ID"] = mid
+    msg["In-Reply-To"] = "<pause@dk>"
+    msg["Date"] = email.utils.format_datetime(when)
+    msg.set_content("<p>" + text + "</p>", subtype="html")
+    return msg
+
+
+del COMMENTS[:]
+del INBOX[:]
+del SENT[:]
+m.save_threads([{
+    "message_id": "<pause@dk>", "subject": "Bluedart escalation 06 Sep",
+    "sent_ist": (T0 - timedelta(hours=4)).isoformat(),
+    "tickets": {"7001": {"ticketId": "id7001", "awb": "313131"}},
+    "status": "awaiting_reply", "followup_sent_ist": None,
+    "processed": {}, "seen_replies": [],
+}])
+
+INBOX.append((b"70", make_reply("<p1@bd>", T0, [("7001", "313131", "OFD")])))
+m.process_replies(verbose=False)
+t = only()
+print("status reply arms the cycle:")
+check("armed 15h out", t["next_followup_ist"],
+      (T0 + timedelta(hours=15)).isoformat())
+
+T_CHAT = T0 + timedelta(hours=16)
+INBOX.append((b"71", plain_reply("<p2@bd>", T_CHAT, "Hi Manish, we will update you.")))
+before = len(COMMENTS)
+m.process_replies(verbose=False)
+t = only()
+print("a conversational reply pauses it:")
+check("nothing was commented", len(COMMENTS), before)
+check("the chase is disarmed", t.get("next_followup_ist"), None)
+check("we record that we are waiting for a status",
+      t.get("awaiting_status_since"), T_CHAT.isoformat())
+check("last_reply_ist moves to their message", t.get("last_reply_ist"),
+      T_CHAT.isoformat())
+check("no chase is due", m.reply_followup_due(t, now=T_CHAT + timedelta(days=5)),
+      False)
+check("run_followups sends nothing",
+      m.run_followups(verbose=False, now=T_CHAT + timedelta(days=5)), 0)
+check("the 15:00 net stays down too",
+      m.followup_due(t, now=T_CHAT + timedelta(days=5)), False)
+check("the chatty mail is marked seen", "<p2@bd>" in t.get("seen_replies"), True)
+
+T_REAL = T_CHAT + timedelta(hours=6)
+INBOX.append((b"72", make_reply("<p3@bd>", T_REAL,
+                                [("7001", "313131", "Under follow up")])))
+m.process_replies(verbose=False)
+t = only()
+print("the real status reply restarts it:")
+check("the remark reached the ticket", COMMENTS[-1], ("7001", "Under follow up"))
+check("re-armed 15h from THAT reply", t["next_followup_ist"],
+      (T_REAL + timedelta(hours=15)).isoformat())
+check("no longer waiting for a status", t.get("awaiting_status_since"), None)
+check("still pending", sorted(m.pending_targets(t)), ["7001"])
+check("chase fires at the new +15h",
+      m.reply_followup_due(t, now=T_REAL + timedelta(hours=15)), True)
+
+
 print()
 if FAILED:
     print("{} FAILURE(S)".format(len(FAILED)))

@@ -72,7 +72,7 @@ m.run_bulk_report = lambda d, t: True
 m.run_download = lambda d: m.OUT / "cp.csv"
 m.run_merge = lambda t, c: m.OUT / "merged.xlsx"
 m.run_mapping = lambda s, asof=None: (m.OUT / "Mapping.xlsx", 5)
-m.thread_ticket_map = lambda p: {}
+m.thread_ticket_map = lambda p: ([], {})   # (header, ticket_map)
 m.record_thread = lambda *a, **k: None
 m.cleanup_run_files = lambda *a, **k: None
 
