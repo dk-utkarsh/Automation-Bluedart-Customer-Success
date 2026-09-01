@@ -2,3 +2,10 @@
 # (imaplib, smtplib, urllib, zipfile) is stdlib.
 selenium==4.41.0
 openpyxl==3.1.5
+
+# Postgres persistence (db.py). Optional at runtime by design: without it every
+# db.* call is a no-op and the pipeline runs on its JSON files, so a missing
+# driver degrades the record rather than stopping the mail. psycopg2 is what is
+# installed on the server (apt python3-psycopg2, system python); db.py accepts
+# psycopg 3 as well.
+psycopg2-binary>=2.9
