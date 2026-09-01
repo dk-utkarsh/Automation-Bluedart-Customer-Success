@@ -93,6 +93,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 # ============================================================================
 
 BASE = pathlib.Path(__file__).parent
+
+# db.py sits beside this file, but main.py is started by cron, by systemd, and
+# imported by webhook_server.py - none of which reliably put its directory on
+# sys.path. Anchor on __file__ rather than the working directory.
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+import db                                                   # noqa: E402
+
 ENV_FILE = BASE / ".env"
 STATE_FILE = BASE / "state.json"
 AWB_FILE = BASE / "awb_registry.json"
@@ -135,6 +143,9 @@ def load_env():
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip()
+    # Persistence is mirrored, not required: an unset DATABASE_URL leaves every
+    # db.* call a no-op and the pipeline runs exactly as it did on JSON alone.
+    db.configure(env.get("DATABASE_URL"))
     return env
 
 
@@ -2355,6 +2366,13 @@ def thread_ticket_map(mapping_path):
         # the run commits, so this is the only surviving copy of the courier,
         # EDD and concern columns - and the chase re-sends them unchanged.
         out[num] = {"ticketId": tid, "awb": awb, "row": list(r)}
+        cells = dict(zip(header, r))
+        db.upsert_ticket(num, ticket_id=tid, awb=awb, extra={
+            "courier": cells.get("Courier Partner"),
+            "logistics_class": cells.get("Concern Type"),
+            "states": cells.get("State"),
+        })
+        db.register_awb(awb, num)
     return header, out
 
 
@@ -2367,10 +2385,22 @@ def record_thread(message_id, subject, ticket_map, columns=None):
 
 def _record_thread(message_id, subject, ticket_map, columns=None):
     threads = load_threads()
+    sent_at = datetime.now(IST)
+    # Mirrored to Postgres as the mail goes out, so the database is a live
+    # record rather than something a migration has to catch up on later.
+    email_id = db.record_email(
+        message_id=message_id, subject=subject, sent_at=sent_at,
+        ticket_map=ticket_map, columns=columns, kind="escalation",
+        from_addr=(ENV.get("MAIL_FROM") or ENV.get("OTP_EMAIL")),
+        to_addrs=[a.strip() for a in (ENV.get("MAIL_TO") or "").split(",")
+                  if a.strip()],
+        cc_addrs=[a.strip() for a in (ENV.get("MAIL_CC") or "").split(",")
+                  if a.strip()])
     threads.append({
         "message_id": message_id,
         "subject": subject,
-        "sent_ist": datetime.now(IST).isoformat(),
+        "db_email_id": email_id,
+        "sent_ist": sent_at.isoformat(),
         "tickets": ticket_map,
         # The mapping header, so a chase can rebuild the same table we escalated
         # with rather than a reduced one.
@@ -2381,7 +2411,9 @@ def _record_thread(message_id, subject, ticket_map, columns=None):
         "seen_replies": [],
     })
     save_threads(threads)
-    print("Thread recorded: {} ticket(s) awaiting reply".format(len(ticket_map)))
+    print("Thread recorded: {} ticket(s) awaiting reply{}".format(
+        len(ticket_map),
+        "  (db id {})".format(email_id) if email_id else ""))
 
 
 def load_threads():
@@ -2956,6 +2988,19 @@ def followup_interval_hours():
         return REPLY_FOLLOWUP_HOURS
 
 
+def db_email_id(thread):
+    """emails_sent.id for this thread, or None when persistence is off.
+
+    Cached on the thread so the chase path does not re-query on every tick."""
+    got = thread.get("db_email_id")
+    if got:
+        return got
+    got = db.email_id_for(thread.get("message_id"))
+    if got:
+        thread["db_email_id"] = got
+    return got
+
+
 def pause_followups(thread, received):
     """Bluedart answered, but not with a status. Stand the chase down.
 
@@ -2969,6 +3014,9 @@ def pause_followups(thread, received):
     thread["last_reply_ist"] = received.isoformat()
     thread["next_followup_ist"] = None
     thread["awaiting_status_since"] = received.isoformat()
+    db.set_followup_state(db_email_id(thread), last_reply_at=received,
+                          next_followup_at=None,
+                          awaiting_status_since=received)
 
 
 def arm_followup(thread, received):
@@ -2984,6 +3032,11 @@ def arm_followup(thread, received):
             received + timedelta(hours=followup_interval_hours())).isoformat()
     else:
         thread["next_followup_ist"] = None
+    db.set_followup_state(
+        db_email_id(thread), last_reply_at=received,
+        awaiting_status_since=None,
+        next_followup_at=(datetime.fromisoformat(thread["next_followup_ist"])
+                          if thread["next_followup_ist"] else None))
 
 
 def reply_followup_due(thread, now=None):
@@ -3091,6 +3144,15 @@ def _process_replies(verbose=True, dry=False):
                     continue
 
                 when = received.strftime(MAIL_DATE_FMT)
+                # The reply, body and all, before any row is handled. message_id
+                # is the idempotency key, so re-reading one inserts nothing.
+                reply_id = None if dry else db.record_reply(
+                    email_id=db_email_id(thread), message_id=rid,
+                    in_reply_to=(msg.get("In-Reply-To") or "").strip() or None,
+                    from_addr=str(msg.get("From") or "") or None,
+                    subject=str(msg.get("Subject") or "") or None,
+                    received_at=received, body_html=html_of(msg),
+                    status_rows_found=len(statuses))
                 touched = []
                 done_this_reply = set()
                 for row in statuses:
@@ -3146,6 +3208,17 @@ def _process_replies(verbose=True, dry=False):
                                       "finalised_ist": received.isoformat()}
                         print("    #{} is final ({!r}) - no further chasing".format(
                             key, status))
+                    # Append-only history, then the cached latest on the line.
+                    # These are the two grains the JSON store could not keep:
+                    # it overwrote the remark and lost everything before it.
+                    db.record_status(reply_id, key, status, awb=awb,
+                                     matched_via=via)
+                    db.apply_latest(db_email_id(home), key, status,
+                                    reply_id=reply_id,
+                                    is_final=is_final_status(status),
+                                    final_reason=("delivered"
+                                                  if is_final_status(status)
+                                                  else None))
                     if home not in touched:
                         touched.append(home)
                     made += 1
@@ -3166,6 +3239,10 @@ def _process_replies(verbose=True, dry=False):
             # answered "OFD" is answered and still outstanding - closing the thread
             # on it is exactly the bug this cycle exists to fix.
             outstanding = sorted(pending_targets(t))
+            if answered and not dry:
+                # Derived in SQL from the lines, so the database agrees with the
+                # thread file rather than being told separately.
+                db.rollup_email(db_email_id(t))
             if answered and not outstanding:
                 if not dry:
                     t["status"] = "completed"
@@ -3217,16 +3294,27 @@ def _run_followups(verbose=True, now=None):
             if thread["followup_round"] >= FOLLOWUP_MAX_ROUNDS:
                 thread["next_followup_ist"] = None
                 thread["stalled_ist"] = now.isoformat()
+                db.set_followup_state(db_email_id(thread), stalled_at=now,
+                                      next_followup_at=None,
+                                      followup_round=thread["followup_round"],
+                                      followup_sent_at=now)
                 print("  {} chases with no delivered status - leaving {} alone: "
                       "{}".format(FOLLOWUP_MAX_ROUNDS, thread.get("subject"),
                                   ", ".join(sorted(pending_targets(thread)))))
             else:
                 thread["next_followup_ist"] = (
                     now + timedelta(hours=followup_interval_hours())).isoformat()
+                db.set_followup_state(
+                    db_email_id(thread),
+                    next_followup_at=datetime.fromisoformat(
+                        thread["next_followup_ist"]),
+                    followup_round=thread["followup_round"],
+                    followup_sent_at=now)
             sent += 1
         elif followup_due(thread, now):
             if send_followup(thread):
                 thread["followup_sent_ist"] = now.isoformat()
+                db.set_followup_state(db_email_id(thread), followup_sent_at=now)
                 sent += 1
     if sent:
         save_threads(threads)
