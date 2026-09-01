@@ -221,6 +221,33 @@ check("and only once", m.run_followups(verbose=False,
                                        now=T0 + timedelta(days=3)), 0)
 
 
+# ============================== one ticket listed twice in the SAME reply
+# Dropping the per-ticket guard is what lets a LATER reply update a ticket
+# again. It must not also let a single reply comment the same ticket twice -
+# the guard that replaced it is per reply, not per thread for all time.
+del COMMENTS[:]
+del INBOX[:]
+m.save_threads([{
+    "message_id": "<dup@dk>",
+    "subject": "Bluedart escalation 03 Sep",
+    "sent_ist": (T0 - timedelta(hours=4)).isoformat(),
+    "tickets": {"3001": {"ticketId": "id3001", "awb": "777222"}},
+    "status": "awaiting_reply",
+    "followup_sent_ist": None,
+    "processed": {},
+    "seen_replies": [],
+}])
+INBOX.append((b"9", make_reply("<dup1@bd>", T0, [
+    ("3001", "777222", "OFD"),
+    ("3001", "777222", "Under follow up"),
+])))
+m.process_replies(verbose=False)
+
+print("a ticket listed twice in one reply:")
+check("commented once, not twice", len(COMMENTS), 1)
+check("and it is still pending", sorted(m.pending_targets(only())), ["3001"])
+
+
 print()
 if FAILED:
     print("{} FAILURE(S)".format(len(FAILED)))

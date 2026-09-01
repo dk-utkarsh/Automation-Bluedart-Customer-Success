@@ -2840,6 +2840,7 @@ def process_replies(verbose=True, dry=False):
                 received = reply_received_at(msg)
                 when = received.strftime(MAIL_DATE_FMT)
                 touched = []
+                done_this_reply = set()
                 for row in statuses:
                     awb, status = row.get("awb", ""), row["status"]
                     owner, target, via = locate_target(threads, thread, row, registry)
@@ -2850,8 +2851,16 @@ def process_replies(verbose=True, dry=False):
                     key = str(target["ticketNumber"])
                     # Keyed on the ticket number, not the AWB: one AWB can have
                     # several tickets, so an AWB key would collapse them into one.
-                    # Booked against the thread that owns the ticket, so that report
-                    # closes properly and cannot comment the same ticket twice.
+                    # Booked against the thread that owns the ticket, so that
+                    # report closes properly.
+                    # One comment per ticket per REPLY. Bluedart sometimes lists a
+                    # ticket twice in one table; without this the row would be
+                    # commented once per occurrence.
+                    if key in done_this_reply:
+                        print("    #{} appears twice in this reply - keeping the "
+                              "first remark".format(key))
+                        continue
+                    done_this_reply.add(key)
                     home = owner or thread
                     book = home.setdefault("processed", {})
                     final = home.setdefault("final", {})
