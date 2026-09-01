@@ -1,0 +1,41 @@
+[Unit]
+Description=Zoho Mail outgoing-webhook receiver (wakes process_replies on new mail)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Matches how this project already runs: the cron entry and every state file
+# (threads.json, state.json, awb_registry.json) are root-owned. Running the listener
+# as a lesser user would leave it unable to write them.
+# WORTH REVISITING: this is an internet-reachable listener on a shared box. Once the
+# project directory is chowned to a dedicated account, switch User/Group to it.
+User=root
+Group=root
+WorkingDirectory=/home/ubuntu/scripts/utkarsh/Automation-Bluedart-Customer-Success
+ExecStart=/usr/bin/python3 -u /home/ubuntu/scripts/utkarsh/Automation-Bluedart-Customer-Success/webhook_server.py
+
+# Zoho silently auto-disables a webhook whose endpoint stops answering, and there is
+# no notification when it does. Restarting unconditionally is what keeps the
+# subscription alive through a crash or a deploy.
+Restart=always
+RestartSec=5
+
+# Timestamps come from an explicit IST constant in main.py, so this only makes the
+# journal read in local time.
+Environment=TZ=Asia/Kolkata
+
+# The listener binds 127.0.0.1 and nginx terminates TLS in front of it, so the
+# service itself never needs a privileged port or a public socket.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/scripts/utkarsh/Automation-Bluedart-Customer-Success
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zoho-desk-webhook
+
+[Install]
+WantedBy=multi-user.target

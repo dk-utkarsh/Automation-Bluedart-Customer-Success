@@ -81,7 +81,8 @@ m.get_token = lambda: "stub-token"
 m.load_registry = lambda: {}
 m.save_registry = lambda reg: None
 m.imap_connect = lambda quiet=False: FakeIMAP()
-m.find_thread_replies = lambda C, thread: [uid for uid, _ in INBOX]
+m.find_thread_replies = (lambda C, thread, siblings=():
+                         [uid for uid, _ in INBOX])
 m.fetch_message = lambda C, uid: dict(INBOX)[uid]
 m.comment_on_ticket = (lambda ticket_id, ticket_number, status, when:
                        COMMENTS.append((str(ticket_number), status)))

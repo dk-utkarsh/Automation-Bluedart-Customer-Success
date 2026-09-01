@@ -54,6 +54,7 @@ Part 2 is skipped, not failed, when part 1 finds no AWBs: a day with no Bluedart
 logistics tickets is a quiet day, not an error.
 """
 
+import contextlib
 import csv
 import email
 import imaplib
@@ -284,7 +285,19 @@ def commit_run(state, ticket, created_utc, export_file, rows, mailed,
 # PART 1 - Zoho Desk
 # ============================================================================
 
-API = "https://desk.zoho.in/api/v1/"
+# Desk API root. The host comes from ZOHO_API_DOMAIN in .env; the literal below is
+# only the fallback for a .env written before that key existed. Resolved per call
+# rather than at import, because ENV is not filled until main() runs.
+DESK_API_DEFAULT = "https://desk.zoho.in"
+
+
+def api_base():
+    domain = (ENV.get("ZOHO_API_DOMAIN") or "").strip().rstrip("/")
+    if not domain or domain == PLACEHOLDER:
+        domain = DESK_API_DEFAULT
+    return domain + "/api/v1/"
+
+
 CUTOFF_HOUR, CUTOFF_MIN = 17, 30
 DESK_ENV = ["ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN"]
 
@@ -420,7 +433,7 @@ def api_get(path, retries=4):
         org = (ENV.get("ZOHO_ORG_ID") or "").strip()
         if org and org != PLACEHOLDER:
             headers["orgId"] = org        # optional: single-org tokens resolve it
-        req = urllib.request.Request(API + path, headers=headers)
+        req = urllib.request.Request(api_base() + path, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
                 return json.load(r)
@@ -1222,7 +1235,7 @@ def start_browser(keep_open=True, headless=None):
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     # Chrome offered to save these credentials on the first successful run, then
     # autofilled them on the next one - and the typed value landed on top of the
-    # autofilled one, producing "Manish@123Manish@123" and an auth failure.
+    # autofilled one, producing a doubled password string and an auth failure.
     opts.add_experimental_option("prefs", {
         "credentials_enable_service": False,
         "profile.password_manager_enabled": False,
@@ -2346,6 +2359,13 @@ def thread_ticket_map(mapping_path):
 
 
 def record_thread(message_id, subject, ticket_map, columns=None):
+    # Locked: the mail has already gone out, so losing this record to a
+    # concurrent reply scan would mail the courier the same escalation again.
+    with threads_lock(label="record_thread"):
+        return _record_thread(message_id, subject, ticket_map, columns)
+
+
+def _record_thread(message_id, subject, ticket_map, columns=None):
     threads = load_threads()
     threads.append({
         "message_id": message_id,
@@ -2371,8 +2391,76 @@ def load_threads():
 
 
 def save_threads(threads):
-    THREADS_FILE.write_text(json.dumps({"threads": threads}, indent=2),
-                            encoding="utf-8")
+    """Atomic replace, so a concurrent reader never sees a half-written file.
+
+    write_text truncates first and then writes, so a reader landing in between got
+    truncated JSON. os.replace swaps the finished file in as one operation."""
+    tmp = THREADS_FILE.with_name(THREADS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps({"threads": threads}, indent=2), encoding="utf-8")
+    os.replace(tmp, THREADS_FILE)
+
+
+THREADS_LOCK_FILE = BASE / ".threads.lock"
+
+
+@contextlib.contextmanager
+def threads_lock(timeout=300, poll=0.25, label=""):
+    """Exclusive cross-process lock over threads.json. Yields True if it was taken.
+
+    WHY: everything that touches threads.json does load -> work -> save on a WHOLE-FILE
+    in-memory copy. A reply scan holds that copy open for as long as an IMAP fetch per
+    open thread plus a Desk POST takes - seconds to minutes. If the daily run's
+    record_thread() appends inside that window, the scan then writes its stale list
+    back over it and the new record is gone. The escalation has ALREADY been mailed by
+    then, so it is unrecoverable: the reply is never matched to a ticket, no chase ever
+    fires, and reported_tickets() stops suppressing those ticket numbers - so the
+    courier is sent the same escalation a second time, which is the exact failure
+    4094fd7 was written to prevent.
+
+    Everything that read-modify-writes the file takes this lock: the reply scan, the
+    daily run's record_thread(), and the follow-up sweep - plus webhook_server.py,
+    which drives the scan from a separate process.
+
+    On timeout it proceeds UNLOCKED rather than aborting. A lost comment is picked up
+    by the next scan; a daily pipeline that refuses to record a mail it has already
+    sent is worse than the race it is avoiding."""
+    THREADS_LOCK_FILE.touch(exist_ok=True)
+    f = open(THREADS_LOCK_FILE, "a+b")
+    deadline = time.time() + timeout
+    locked = False
+    try:
+        while True:
+            try:
+                f.seek(0)
+                if IS_WINDOWS:
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    print("  warning: threads.json lock held by another process for "
+                          "{}s - proceeding without it{}".format(
+                              timeout, " ({})".format(label) if label else ""))
+                    break
+                time.sleep(poll)
+        yield locked
+    finally:
+        if locked:
+            try:
+                f.seek(0)
+                if IS_WINDOWS:
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        f.close()
 
 
 def api_post(path, payload, retries=3):
@@ -2385,7 +2473,7 @@ def api_post(path, payload, retries=3):
         org = (ENV.get("ZOHO_ORG_ID") or "").strip()
         if org and org != PLACEHOLDER:
             headers["orgId"] = org
-        req = urllib.request.Request(API + path, data=body, headers=headers,
+        req = urllib.request.Request(api_base() + path, data=body, headers=headers,
                                      method="POST")
         try:
             with urllib.request.urlopen(req, timeout=45) as r:
@@ -2517,17 +2605,50 @@ def fetch_message(C, uid):
     return None
 
 
-def find_thread_replies(C, thread):
-    """UIDs of replies to this thread, oldest first.
+def header_date(raw):
+    """A Date: header as an aware datetime, or None when it cannot be read.
+
+    A naive value is read as IST rather than thrown away: a missing offset is far more
+    often a client that omitted one than a message from another zone, and an aware
+    value is required for the comparison below to work at all."""
+    if not raw:
+        return None
+    try:
+        d = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=IST)
+
+
+def find_thread_replies(C, thread, siblings=()):
+    """UIDs of replies to THIS thread, oldest first.
 
     Matching is done CLIENT-SIDE on the fetched headers. Zoho's IMAP answers
     `SEARCH HEADER "In-Reply-To" ...` with OK and zero hits even when the message is
     plainly there, so a server-side header search silently finds nothing. Only the
     date range is pushed to the server; the decision stays here.
 
-    A message counts as ours only if it carries our Message-ID in In-Reply-To or
-    References - or, for clients that rewrite those, if it repeats our exact dated
-    subject and actually contains a Status table. Nothing else is ever touched."""
+    A reply belongs to exactly ONE report, and these rules decide which, in order:
+
+    1. It quotes our Message-ID in In-Reply-To/References -> it is that report's,
+       full stop. This is the authoritative case and covers every normal mail client.
+
+    2. It quotes a DIFFERENT report of ours -> it belongs to that one, so this thread
+       declines it. Without this rule the subject fallback below would claim it too:
+       every report shares the fixed subject prefix, and reports sent on the same day
+       share the subject byte for byte, so an answer to the morning report would also
+       be applied to the afternoon one and mark it answered although the courier
+       never saw it.
+
+    3. It quotes none of ours and merely repeats the subject (a client that stripped
+       the headers) -> it is booked to the NEAREST REPORT THAT PRECEDES IT, since
+       that is the one it was most likely written against. Every other same-subject
+       thread declines it, so it is applied once and only once. A reply older than a
+       report can never be that report's. If its date is unreadable it is accepted
+       only when this is the sole thread carrying that subject; otherwise there is
+       nothing left to tell them apart and it is left alone rather than guessed at."""
     C.select("INBOX", readonly=True)
     sent = datetime.fromisoformat(thread["sent_ist"])
     since = (sent - timedelta(days=1)).strftime("%d-%b-%Y")
@@ -2540,10 +2661,17 @@ def find_thread_replies(C, thread):
 
     mid = thread["message_id"].strip()
     subject_tail = thread["subject"].strip().lower()
+    # Every other report we have sent: their ids claim a reply away from this thread,
+    # and those sharing this subject compete for a header-less one.
+    others = [t for t in siblings if t is not thread]
+    other_mids = {(t.get("message_id") or "").strip() for t in others} - {"", mid}
+    same_subject = [t for t in others
+                    if (t.get("subject") or "").strip().lower() == subject_tail]
+
     out = []
     for uid in (data[0] or b"").split():
         typ, d = C.uid("FETCH", uid,
-                       "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT)])")
+                       "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT DATE)])")
         item = next((i for i in (d or []) if isinstance(i, tuple)), None)
         if not item:
             continue
@@ -2551,11 +2679,24 @@ def find_thread_replies(C, thread):
         if (h.get("Message-ID") or "").strip() == mid:
             continue                                   # our own sent copy
         refs = "{} {}".format(h.get("In-Reply-To") or "", h.get("References") or "")
-        if mid in refs:
+        if mid in refs:                                 # rule 1
             out.append(uid)
+            continue
+        if any(o in refs for o in other_mids):          # rule 2 - another report's
             continue
         subj = str(make_header(decode_header(h.get("Subject") or ""))).strip().lower()
         if subj.endswith(subject_tail) and subj != subject_tail:
+            when = header_date(h.get("Date"))           # rule 3
+            if when is None:
+                if same_subject:
+                    continue                            # cannot be told apart
+            else:
+                if when < sent:
+                    continue                            # predates this report
+                nearer = [t for t in same_subject
+                          if sent < datetime.fromisoformat(t["sent_ist"]) <= when]
+                if nearer:
+                    continue                            # a later report fits better
             msg = fetch_message(C, uid)
             if msg is not None and parse_status_table(html_of(msg)):
                 out.append(uid)
@@ -2608,10 +2749,17 @@ def pending_targets(thread):
 def locate_target(threads, current, row, registry):
     """Resolve one reply row to the ticket it belongs to.
 
-    THE TICKET NUMBER IS THE ONLY KEY. One AWB can have several tickets raised against
-    it, so resolving by AWB can land a status on the wrong ticket. A row that carries
-    no ticket number is therefore SKIPPED rather than guessed at - the ticket number is
-    unique and we put it in the mail precisely so that it comes back to us.
+    THE TICKET NUMBER IS THE PREFERRED KEY. It is unique, and we put it in the mail
+    precisely so that it comes back to us, so a row carrying one is resolved on that
+    alone and the AWB is never consulted.
+
+    The AWB is the fallback for the rows that have no ticket number, which is most of
+    them in practice: Bluedart usually answer on their own template, which has an AWB
+    column and no ticket column. Requiring a ticket number there dropped every row of
+    every such reply, so nothing was ever commented. An AWB is NOT unique - one
+    shipment can carry several tickets - so it only decides when it resolves to
+    exactly one ticket among the threads awaiting a reply; anything ambiguous is
+    reported and skipped, never guessed at.
 
     Bluedart also answers on whichever mail is nearest to hand, so a reply to Monday's
     report routinely carries rows from Wednesday's. Every open thread is searched, and
@@ -2626,8 +2774,27 @@ def locate_target(threads, current, row, registry):
 
     num = (row.get("ticket") or "").strip()
     if not num:
-        # Deliberately not falling back to the AWB - see the docstring.
-        return None, None, "no ticket number in the reply row"
+        # Bluedart answer on their own template: AWB and a status, no ticket column.
+        # An AWB is NOT unique - the same shipment can carry several tickets - so it
+        # is trusted ONLY when it resolves to exactly one ticket across the threads we
+        # are still waiting on. More than one hit is reported and skipped rather than
+        # guessed at, which is the case the ticket-number rule was protecting against.
+        awb = norm_awb(row.get("awb") or "")
+        if not awb:
+            return None, None, "no ticket number and no AWB in the reply row"
+        hits = {}
+        for t in order:
+            for n, meta in thread_targets(t).items():
+                if norm_awb(meta.get("awb") or "") == awb and n not in hits:
+                    hits[n] = (t, meta)
+        if len(hits) == 1:
+            n, (t, meta) = next(iter(hits.items()))
+            return t, {"ticketNumber": n, "ticketId": meta.get("ticketId")}, \
+                "AWB {} -> #{} on {}".format(awb, n, where(t))
+        if len(hits) > 1:
+            return None, None, ("AWB {} matches {} tickets ({}) - ambiguous, skipped"
+                                .format(awb, len(hits), ", ".join(sorted(hits))))
+        return None, None, "AWB {} is not on any thread awaiting a reply".format(awb)
 
     for t in order:
         meta = thread_targets(t).get(num)
@@ -2862,6 +3029,17 @@ def process_replies(verbose=True, dry=False):
     dry=True resolves everything and prints what WOULD be written, touching neither a
     ticket nor the thread file. Since it changes nothing it also inspects threads that
     are already completed, so a finished mapping can still be reviewed."""
+    # A dry run writes nothing, so it needs no lock and must not block a real one.
+    if dry:
+        return _process_replies(verbose=verbose, dry=True)
+    # Held across the WHOLE scan - load through save - because that span is exactly
+    # the window in which another process's append would be lost. webhook_server.py
+    # drives this from a separate process, and --watch from another again.
+    with threads_lock(label="process_replies"):
+        return _process_replies(verbose=verbose, dry=False)
+
+
+def _process_replies(verbose=True, dry=False):
     global TOKEN
     threads = load_threads()
     open_threads = [t for t in threads
@@ -2879,7 +3057,10 @@ def process_replies(verbose=True, dry=False):
     made = 0
     try:
         for thread in open_threads:
-            uids = find_thread_replies(C, thread)
+            # Every thread is passed in, not just the open ones: a reply that names a
+            # report we have already closed belongs to that one, and must not be
+            # re-applied to a newer report that happens to share its subject.
+            uids = find_thread_replies(C, thread, threads)
             if verbose:
                 print("\nThread {} - {} reply/replies".format(
                     thread["subject"], len(uids)))
@@ -3017,6 +3198,13 @@ def run_followups(verbose=True, now=None):
     The cycle re-arms itself on send rather than only on reply, so a thread that
     goes quiet after one answer keeps being chased instead of stalling with AWBs
     still open. At the cap it disarms and is left alone."""
+    # Locked: without it a concurrent reply scan can write back a copy loaded
+    # before followup_sent_ist was stamped, and the courier is nudged twice.
+    with threads_lock(label="run_followups"):
+        return _run_followups(verbose, now)
+
+
+def _run_followups(verbose=True, now=None):
     threads = load_threads()
     now = now or datetime.now(IST)
     sent = 0
@@ -3102,7 +3290,7 @@ def watch(poll_fallback=60):
 # ============================================================================
 
 REAL_OTP_MAIL = (
-    "Your ClickPost Login OTP Login OTP Verification Hello Manish123@dentalkart, "
+    "Your ClickPost Login OTP Login OTP Verification Hello account.holder, "
     "Your One-Time Password (OTP) for ClickPost login is: X63YUN This OTP is valid "
     "for 10 minutes only. If you did not request this OTP, please ignore this email.")
 REAL_REPORT_MAIL = (
