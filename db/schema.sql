@@ -353,17 +353,11 @@ SELECT
     ev.desk_comments_posted,
     ev.last_desk_comment_at,
     t.delivered_at,
-    t.delivered_status_text,
-    t.rto_at,
-    t.rto_status_text,
-    CASE WHEN t.delivered_at IS NOT NULL THEN 'delivered'
-         WHEN t.rto_at       IS NOT NULL THEN 'rto'
-         WHEN ev.last_reply_at IS NOT NULL THEN 'answered, still open'
-         WHEN ev.first_email_sent_at IS NOT NULL THEN 'awaiting first reply'
-         ELSE 'not escalated' END                   AS outcome,
-    -- How long the whole chase took, first escalation to the final answer.
-    coalesce(t.delivered_at, t.rto_at) - ev.first_email_sent_at
-                                                    AS time_to_outcome
+    t.delivered_status_text
+-- Deliberately NOT exposed here, at the user's request (2026-09-02):
+-- rto_at, rto_status_text, outcome and time_to_outcome. The RTO columns are
+-- still recorded on tickets and the 'rto' event is still written to
+-- ticket_events, so nothing is lost and adding them back is a one-line change.
 FROM tickets t
 LEFT JOIN LATERAL (
     SELECT
