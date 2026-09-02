@@ -11,6 +11,7 @@ output/
 state.json
 awb_registry.json
 threads.json
+.threads.lock
 
 __pycache__/
 *.pyc

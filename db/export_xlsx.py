@@ -9,6 +9,7 @@ No database driver needed - psql does the reading in CSV mode.
 """
 import csv
 import io
+import os
 import re
 import subprocess
 import sys
@@ -18,7 +19,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-ENV = Path("/home/ubuntu/scripts/utkarsh/Automation-Bluedart-Customer-Success/.env")
+# Beside this script's repo, not a hardcoded server path, so the exporter runs
+# from any checkout. BLUEDART_ENV overrides it.
+ENV = Path(os.environ.get("BLUEDART_ENV")
+           or Path(__file__).resolve().parent.parent / ".env")
 OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/bluedart_escalation.xlsx")
 
 # Dependency order, so the sheets read the way the data is written.
@@ -31,6 +35,11 @@ TABLES = [
     ("email_replies",         "id"),
     ("email_tickets",         "email_id, ticket_number"),
     ("reply_ticket_statuses", "id"),
+    ("email_followups",       "email_id, sent_at"),
+    ("ticket_events",         "ticket_number, occurred_at, id"),
+    # A view, not a table - SELECT works the same and this is the sheet most
+    # people will actually open.
+    ("ticket_journey",        "ticket_number"),
 ]
 
 ROLE = {
@@ -42,6 +51,9 @@ ROLE = {
     "runs":                  "Run ledger and watermark (replaces state.json)",
     "awb_registry":          "One keeper ticket per AWB (replaces awb_registry.json)",
     "clickpost_statuses":    "Courier snapshot per run per AWB",
+    "email_followups":       "HISTORY - one row per chase sent, append-only",
+    "ticket_events":         "TIMELINE - every event in a ticket's life, append-only",
+    "ticket_journey":        "REPORTING VIEW - one row per ticket, the whole journey",
 }
 
 HDR_FILL = PatternFill("solid", fgColor="1F52C8")
@@ -65,7 +77,10 @@ def csv_query(sql):
     """Run a query and return (header, rows)."""
     r = subprocess.run(
         ["psql", "-h", HOST, "-p", PORT, "-U", USER, "-d", DB, "--csv", "-c", sql],
-        capture_output=True, text=True, env={"PGPASSWORD": PW, "PATH": "/usr/bin:/bin"})
+        capture_output=True, text=True,
+        # Inherit the caller's environment rather than replacing it: pinning PATH
+        # to /usr/bin:/bin meant psql could only ever be found on one server.
+        env={**os.environ, "PGPASSWORD": PW})
     if r.returncode:
         raise SystemExit("psql failed: " + r.stderr.strip())
     rows = list(csv.reader(io.StringIO(r.stdout)))
