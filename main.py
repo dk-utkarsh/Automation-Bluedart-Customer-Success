@@ -230,6 +230,16 @@ def mark_stage(state, stage):
     if state.get("pending"):
         state["pending"]["stage_reached"] = stage
         save_state(state)
+    db.mark_stage(state.get("db_run_id"), stage)
+
+
+def fail_current_run(state, error):
+    """Record that the open run failed.
+
+    Persistence only. The pending block in state.json is what actually drives
+    the retry and is deliberately left exactly as it was - this just stops the
+    run row sitting at 'pending' forever."""
+    db.fail_run(state.get("db_run_id"), error)
 
 
 def cleanup_run_files(paths, keep=False):
@@ -288,6 +298,12 @@ def commit_run(state, ticket, created_utc, export_file, rows, mailed,
     state["last_mail_sent_ist"] = datetime.now(IST).isoformat() if mailed else \
         state.get("last_mail_sent_ist")
     state.pop("pending", None)
+    # Mirrored before db_run_id is dropped, so the run row closes with the same
+    # watermark the JSON just committed.
+    db.commit_run(state.get("db_run_id"), ticket, created_utc,
+                  modified_utc=modified_utc, rows_count=rows,
+                  mailer_sent=mailed)
+    state.pop("db_run_id", None)
     save_state(state)
     print("\nWatermark committed -> next run starts after #{}".format(ticket))
 
@@ -696,6 +712,15 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     print("Window : {:%Y-%m-%d %H:%M} -> {:%Y-%m-%d %H:%M} IST".format(
         start_utc.astimezone(IST), cutoff_ist))
 
+    # Opened here rather than at the export, so a run that finds nothing - or
+    # dies in the fetch - is still on the record. The id rides in state.json so
+    # a resumed run closes the row it opened instead of starting a second one.
+    run_db_id = db.begin_run(watermark_ticket=state.get("last_ticket_number"),
+                             watermark_utc=state.get("last_created_utc"))
+    if run_db_id:
+        state["db_run_id"] = run_db_id
+        save_state(state)
+
     TOKEN = get_token()
     tickets = collect_tickets(start_utc, end_utc, inclusive)
     print("Tickets in window: {}".format(len(tickets)))
@@ -749,6 +774,18 @@ def run_desk_fetch(state, force_today=False, force_now=False):
     with ThreadPoolExecutor(max_workers=5) as pool:
         rows = list(pool.map(fetch_detail, tickets + late))
     rows.sort(key=lambda r: r["created_utc"])
+
+    # Every ticket this run EXAMINED, before any filter. "Processed" means looked
+    # at, not merely mailed: recording only the survivors left no way to answer
+    # why a ticket never reached a report.
+    for r in rows:
+        db.upsert_ticket(r["ticketNumber"], ticket_id=r.get("ticketId"),
+                         awb=norm_awb(r.get("AWB Number")) or None,
+                         created_utc=r["created_utc"],
+                         extra={"courier": r.get(COURIER_FIELD),
+                                "logistics_class": r.get("Logistics Classification"),
+                                "states": r.get("States")},
+                         run_id=run_db_id)
 
     # The created watermark is the last ticket SEEN by the FIRST sweep, before any
     # filtering, so that non-logistics tickets at its tail are not re-scanned every
@@ -2326,6 +2363,24 @@ def is_final_status(text):
     return t.replace(" ", "").startswith("rto")
 
 
+def is_delivered_status(text):
+    """True when the remark says the shipment was actually delivered.
+
+    Persistence only - this decides the Delivered Date and nothing else. It is
+    deliberately NARROWER than is_final_status, which answers "stop chasing" and
+    is therefore true of plain RTO as well: a parcel heading back needs no chase,
+    but nothing has been delivered to anyone yet.
+
+    "RTO Delivered" DOES count - the shipment was delivered, back to origin - and
+    falls out of the same substring test without a special case. The negations
+    are is_final_status's own, so "Undelivered" and "could not be delivered" can
+    never stamp a Delivered Date."""
+    t = " ".join(str(text or "").split()).lower()
+    if not t or _UNDELIVERED.search(t) or _NEGATED.search(t):
+        return False
+    return "delivered" in t
+
+
 def thread_ticket_map(mapping_path):
     """(header, {ticketNumber: {"ticketId", "awb", "row"}}) for the mail just sent.
 
@@ -2920,6 +2975,11 @@ def followup_body(thread):
     return text, html
 
 
+def addr_list(key):
+    """A comma-separated .env address list as a list. Persistence only."""
+    return [a.strip() for a in (ENV.get(key) or "").split(",") if a.strip()]
+
+
 def send_followup(thread):
     """Chase on the same thread, so it lands in the existing conversation."""
     import smtplib
@@ -3194,10 +3254,16 @@ def _process_replies(verbose=True, dry=False):
                         made += 1
                         continue
                     try:
-                        comment_on_ticket(target["ticketId"], key, status, when)
+                        posted = comment_on_ticket(target["ticketId"], key,
+                                                   status, when)
                     except Exception as e:
                         print("    FAILED ticket {}: {}".format(key, e))
                         continue
+                    # comment_on_ticket's return was previously discarded. Desk
+                    # answers with the comment it created, so this is the only
+                    # place its id can be captured for the record.
+                    comment_id = (posted or {}).get("id") \
+                        if isinstance(posted, dict) else None
                     book[key] = {"status": status, "awb": awb, "via": via,
                                  "commented_ist": datetime.now(IST).isoformat()}
                     # Finality is recorded once and never lifted: a later non-final
@@ -3212,13 +3278,30 @@ def _process_replies(verbose=True, dry=False):
                     # These are the two grains the JSON store could not keep:
                     # it overwrote the remark and lost everything before it.
                     db.record_status(reply_id, key, status, awb=awb,
-                                     matched_via=via)
+                                     matched_via=via, received_at=received,
+                                     desk_comment_id=comment_id,
+                                     desk_posted_at=datetime.now(IST))
                     db.apply_latest(db_email_id(home), key, status,
                                     reply_id=reply_id,
+                                    desk_comment_id=comment_id,
+                                    desk_posted_at=datetime.now(IST),
                                     is_final=is_final_status(status),
-                                    final_reason=("delivered"
-                                                  if is_final_status(status)
-                                                  else None))
+                                    final_reason=(
+                                        None if not is_final_status(status)
+                                        else "delivered"
+                                        if is_delivered_status(status)
+                                        else "rto"))
+                    # The two outcomes are stamped separately. Narrower than
+                    # finality on purpose: plain RTO is final but nothing was
+                    # delivered, while "RTO Delivered" was. Both carry the
+                    # reply's own received time, and both keep the first one
+                    # forever.
+                    if is_delivered_status(status):
+                        db.mark_delivered(key, received, status_text=status,
+                                          awb=awb, reply_id=reply_id)
+                    elif is_final_status(status):
+                        db.mark_rto(key, received, status_text=status,
+                                    awb=awb, reply_id=reply_id)
                     if home not in touched:
                         touched.append(home)
                     made += 1
@@ -3287,8 +3370,23 @@ def _run_followups(verbose=True, now=None):
     sent = 0
     for thread in threads:
         if reply_followup_due(thread, now):
+            # Captured BEFORE the send: these are what this chase went out with.
+            # followup_body is the same pure call send_followup makes, from the
+            # same thread state, so it cannot fail here without failing there.
+            chased = sorted(pending_targets(thread))
+            body_text, body_html = followup_body(thread)
             if not send_followup(thread):
                 continue                  # left armed in the past; retried next tick
+            # Appended before the round is incremented, so the row describes the
+            # chase that actually went out rather than the next one.
+            db.record_followup(
+                db_email_id(thread),
+                round=int(thread.get("followup_round") or 0) + 1,
+                kind="reply_anchored", sent_at=now,
+                to_addrs=addr_list("MAIL_TO"), cc_addrs=addr_list("MAIL_CC"),
+                subject="Re: " + str(thread.get("subject") or ""),
+                body_text=body_text, body_html=body_html,
+                ticket_numbers=chased)
             thread["followup_round"] = int(thread.get("followup_round") or 0) + 1
             thread["followup_sent_ist"] = now.isoformat()
             if thread["followup_round"] >= FOLLOWUP_MAX_ROUNDS:
@@ -3312,9 +3410,20 @@ def _run_followups(verbose=True, now=None):
                     followup_sent_at=now)
             sent += 1
         elif followup_due(thread, now):
+            chased = sorted(pending_targets(thread))
+            body_text, body_html = followup_body(thread)
             if send_followup(thread):
                 thread["followup_sent_ist"] = now.isoformat()
                 db.set_followup_state(db_email_id(thread), followup_sent_at=now)
+                db.record_followup(
+                    db_email_id(thread),
+                    round=int(thread.get("followup_round") or 0),
+                    kind="no_reply", sent_at=now,
+                    to_addrs=addr_list("MAIL_TO"),
+                    cc_addrs=addr_list("MAIL_CC"),
+                    subject="Re: " + str(thread.get("subject") or ""),
+                    body_text=body_text, body_html=body_html,
+                    ticket_numbers=chased)
                 sent += 1
     if sent:
         save_threads(threads)
@@ -3620,6 +3729,7 @@ def main():
     except Exception as e:
         print("\nFAILED: {}: {}".format(e.__class__.__name__, e))
         print("The watermark stays put - the next run retries these same tickets.")
+        fail_current_run(state, e)
         return 1
 
     # ---- Part 4: Mail ------------------------------------------------------
@@ -3637,6 +3747,7 @@ def main():
         if not mailed:
             print("\nMail did NOT go out. The watermark stays put, so the next run")
             print("re-processes these same tickets rather than skipping them.")
+            fail_current_run(state, "mailer did not accept the message")
             return 1
         # Persisted the moment SMTP accepts, BEFORE anything else can fail. If the
         # process dies between here and commit_run, the next run has to know the mail
