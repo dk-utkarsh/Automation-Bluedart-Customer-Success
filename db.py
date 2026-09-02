@@ -38,6 +38,16 @@ def configure(url):
     _URL = (url or "").strip() or None
     _DISABLED = _URL is None
     _WARNED = False
+    # Said out loud every start. Silence used to be indistinguishable from
+    # working: with no DATABASE_URL every write became a no-op and printed
+    # nothing, so the tables stayed empty and looked healthy.
+    if _URL is None:
+        print("  db: persistence OFF - DATABASE_URL is not set. Running on JSON.")
+    elif psycopg is None:
+        print("  db: persistence OFF - no psycopg driver installed. "
+              "Running on JSON.")
+    else:
+        print("  db: persistence ON (psycopg {}).".format(_V))
 
 
 def enabled():
@@ -103,6 +113,13 @@ def begin_run(watermark_ticket=None, watermark_utc=None, modified_utc=None,
     with tx() as cur:
         if not cur:
             return None
+        # runs_one_pending allows a single pending row. A run that died without
+        # committing would otherwise block every future begin_run, silently, so
+        # starting a new run closes out whatever was left open.
+        cur.execute(
+            "UPDATE runs SET status='failed', finished_at=now(), "
+            "error=coalesce(error, 'superseded by a later run') "
+            "WHERE status='pending'")
         cur.execute(
             "INSERT INTO runs (started_at, status, watermark_ticket, "
             "watermark_utc, modified_utc, export_file) "
@@ -179,6 +196,65 @@ def upsert_ticket(ticket_number, ticket_id=None, awb=None, created_utc=None,
              extra.get("logistics_class"), extra.get("states"), run_id))
 
 
+def mark_delivered(ticket_number, delivered_at, status_text=None, awb=None,
+                   reply_id=None):
+    """Stamp the Delivered Date on the ticket. Written once, never moved.
+
+    Every column uses coalesce(column, %s), so the FIRST delivered remark wins
+    and everything after it is a no-op. Bluedart answering the same thread again
+    after delivery - a courtesy note, a correction, a second Delivered on a
+    re-used AWB - must not change when the shipment was actually delivered.
+
+    What counts as delivered is is_delivered_status() in main.py, never decided
+    here: this module stores facts, it does not classify them."""
+    if not ticket_number or not delivered_at:
+        return
+    with tx() as cur:
+        if cur:
+            cur.execute(
+                "UPDATE tickets SET "
+                "  delivered_at          = coalesce(delivered_at, %s), "
+                "  delivered_status_text = coalesce(delivered_status_text, %s), "
+                "  delivered_awb         = coalesce(delivered_awb, %s), "
+                "  delivered_reply_id    = coalesce(delivered_reply_id, %s), "
+                "  delivered_recorded_at = coalesce(delivered_recorded_at, now()) "
+                # Belt and braces with the coalesce above: this also makes a
+                # repeat stamp match NO row, which is how the timeline below
+                # knows not to log a second delivery of the same shipment.
+                "WHERE ticket_number=%s AND delivered_at IS NULL",
+                (delivered_at, status_text, awb, reply_id, str(ticket_number)))
+            if cur.rowcount:
+                _event(cur, ticket_number, "delivered", delivered_at,
+                       status_text=status_text, awb=awb, reply_id=reply_id)
+
+
+def mark_rto(ticket_number, rto_at, status_text=None, awb=None, reply_id=None):
+    """Stamp when the shipment turned RTO. Written once, never moved.
+
+    The mirror of mark_delivered, and deliberately a SEPARATE column: a plain
+    RTO ends the chase but delivers nothing, so it must never fill
+    delivered_at. "RTO Delivered" is the other case and goes to mark_delivered
+    instead - is_delivered_status() in main.py decides which, never this module.
+
+    rto_at is the reply's own received time. email_tickets.finalised_at is not a
+    substitute: that is now(), when the run happened to read the mail."""
+    if not ticket_number or not rto_at:
+        return
+    with tx() as cur:
+        if cur:
+            cur.execute(
+                "UPDATE tickets SET "
+                "  rto_at          = coalesce(rto_at, %s), "
+                "  rto_status_text = coalesce(rto_status_text, %s), "
+                "  rto_reply_id    = coalesce(rto_reply_id, %s), "
+                "  rto_recorded_at = coalesce(rto_recorded_at, now()) "
+                "WHERE ticket_number=%s AND rto_at IS NULL",
+                (rto_at, status_text, reply_id, str(ticket_number)))
+            if cur.rowcount:
+                _event(cur, ticket_number, "rto", rto_at,
+                       status_text=status_text, awb=awb, reply_id=reply_id)
+
+
 def register_awb(awb, ticket_number, created_utc=None):
     """The dedup registry. An AWB already here is never escalated again."""
     if not awb or not ticket_number:
@@ -208,6 +284,64 @@ def save_clickpost(run_id, rows):
                  json.dumps(raw) if raw is not None else None))
             n += 1
     return n
+
+
+# ------------------------------------------------------------- timeline
+def _event(cur, ticket_number, event_type, occurred_at, **kw):
+    """Append one timeline row on an OPEN cursor.
+
+    Takes the cursor rather than opening its own so an event lands in the same
+    transaction as the thing it describes - a chase and its timeline entries
+    commit together or not at all."""
+    if not cur or not ticket_number or not occurred_at:
+        return
+    cur.execute(
+        "INSERT INTO ticket_events (ticket_number, event_type, occurred_at, "
+        "  status_text, awb, email_id, reply_id, followup_id, run_id, "
+        "  desk_comment_id, detail) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (str(ticket_number), event_type, occurred_at, kw.get("status_text"),
+         kw.get("awb"), kw.get("email_id"), kw.get("reply_id"),
+         kw.get("followup_id"), kw.get("run_id"), kw.get("desk_comment_id"),
+         json.dumps(kw["detail"]) if kw.get("detail") is not None else None))
+
+
+def record_event(ticket_number, event_type, occurred_at, **kw):
+    """Append one entry to a ticket's timeline. Never updates, never deletes."""
+    with tx() as cur:
+        if cur:
+            _event(cur, ticket_number, event_type, occurred_at, **kw)
+
+
+def record_followup(email_id, round=None, kind=None, sent_at=None,
+                    to_addrs=None, cc_addrs=None, subject=None,
+                    body_text=None, body_html=None, ticket_numbers=None):
+    """One chase that actually went out. Returns email_followups.id.
+
+    Called only after SMTP accepted, so the table records what was sent rather
+    than what was attempted. Each call appends; nothing collapses two sends into
+    one row."""
+    if email_id is None or not sent_at:
+        return None
+    nums = [str(n) for n in (ticket_numbers or [])]
+    with tx() as cur:
+        if not cur:
+            return None
+        cur.execute(
+            "INSERT INTO email_followups (email_id, round, kind, sent_at, "
+            "  to_addrs, cc_addrs, subject, body_text, body_html, "
+            "  ticket_numbers) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (email_id, round, kind, sent_at, to_addrs, cc_addrs, subject,
+             body_text, body_html, nums))
+        row = cur.fetchone()
+        followup_id = row[0] if row else None
+        for num in nums:
+            _event(cur, num, "followup_sent", sent_at, email_id=email_id,
+                   followup_id=followup_id,
+                   detail={"round": round, "kind": kind})
+        return followup_id
+    return None
 
 
 # -------------------------------------------------------- outbound mail
@@ -247,6 +381,10 @@ def record_email(message_id, subject, sent_at, ticket_map, columns=None,
                 "                         email_tickets.mapping_row)",
                 (email_id, str(num), meta.get("awb"),
                  json.dumps(meta.get("row")) if meta.get("row") else None))
+            # The first entry on this ticket's timeline: the escalation itself.
+            _event(cur, num, "email_sent", sent_at, awb=meta.get("awb"),
+                   email_id=email_id, run_id=run_id,
+                   detail={"kind": kind, "subject": subject})
         return email_id
     return None
 
@@ -288,8 +426,14 @@ def record_reply(email_id, message_id, in_reply_to=None, from_addr=None,
 
 
 def record_status(reply_id, ticket_number, status_text, awb=None,
-                  matched_via=None, desk_comment_id=None, post_error=None):
-    """Append one remark to the history. Never replaces an earlier one."""
+                  matched_via=None, desk_comment_id=None, post_error=None,
+                  received_at=None, desk_posted_at=None):
+    """Append one remark to the history. Never replaces an earlier one.
+
+    received_at is when Bluedart's reply landed - the Date header, not when this
+    run read it - and becomes the remark's place on the ticket's timeline. Without
+    it the row is still stored; only the timeline entry is skipped, since an event
+    with no time on it would sort arbitrarily."""
     if reply_id is None or not ticket_number:
         return None
     with tx() as cur:
@@ -306,12 +450,22 @@ def record_status(reply_id, ticket_number, status_text, awb=None,
             (reply_id, str(ticket_number), awb, status_text, matched_via,
              desk_comment_id, post_error))
         row = cur.fetchone()
+        _event(cur, ticket_number, "status_recorded", received_at,
+               status_text=status_text, awb=awb, reply_id=reply_id,
+               detail={"matched_via": matched_via} if matched_via else None)
+        if desk_comment_id:
+            # A separate entry: the remark arriving and the comment reaching Desk
+            # are two different moments, and the report asks for both.
+            _event(cur, ticket_number, "desk_comment_posted",
+                   desk_posted_at or received_at, status_text=status_text,
+                   awb=awb, reply_id=reply_id, desk_comment_id=desk_comment_id)
         return row[0] if row else None
     return None
 
 
 def apply_latest(email_id, ticket_number, status_text, reply_id=None,
-                 is_final=False, final_reason=None):
+                 is_final=False, final_reason=None, desk_comment_id=None,
+                 desk_posted_at=None):
     """Cache the newest remark on the line, and finalise it if it is done.
 
     Finality is set once and never lifted: a later non-final remark updates the
@@ -323,21 +477,39 @@ def apply_latest(email_id, ticket_number, status_text, reply_id=None,
             cur.execute(
                 "UPDATE email_tickets SET line_status='answered', "
                 "  latest_status_text=%s, latest_reply_id=%s, answered_at=now(), "
+                "  desk_comment_id = coalesce(%s, email_tickets.desk_comment_id), "
+                "  desk_posted_at  = coalesce(%s, email_tickets.desk_posted_at), "
                 "  is_final = email_tickets.is_final OR %s, "
                 "  final_reason = coalesce(email_tickets.final_reason, %s), "
                 "  finalised_at = CASE WHEN email_tickets.is_final THEN "
                 "                      email_tickets.finalised_at "
                 "                 WHEN %s THEN now() ELSE NULL END "
                 "WHERE email_id=%s AND ticket_number=%s",
-                (status_text, reply_id, bool(is_final),
+                (status_text, reply_id, desk_comment_id, desk_posted_at,
+                 bool(is_final),
                  final_reason if is_final else None, bool(is_final),
                  email_id, str(ticket_number)))
 
 
-def set_followup_state(email_id, last_reply_at=None, next_followup_at=None,
-                       followup_round=None, awaiting_status_since=None,
-                       stalled_at=None, followup_sent_at=None):
-    """The 15-hour cycle's state. Only the arguments given are written."""
+class _Unset:
+    def __repr__(self):
+        return "<unset>"
+
+
+# Defined above set_followup_state because it is that function's default. With
+# None as the default there was no way to tell "leave this column alone" from
+# "set this column to NULL", so every call wrote all six columns and a caller
+# naming one of them silently erased the other five.
+_UNSET = _Unset()
+
+
+def set_followup_state(email_id, last_reply_at=_UNSET, next_followup_at=_UNSET,
+                       followup_round=_UNSET, awaiting_status_since=_UNSET,
+                       stalled_at=_UNSET, followup_sent_at=_UNSET):
+    """The 15-hour cycle's state. Only the arguments given are written.
+
+    Passing None is still a write - it clears that column, which is how a reply
+    disarms next_followup_at. Omitting an argument leaves the column untouched."""
     if email_id is None:
         return
     sets, args = [], []
@@ -357,14 +529,6 @@ def set_followup_state(email_id, last_reply_at=None, next_followup_at=None,
         if cur:
             cur.execute("UPDATE emails_sent SET {} WHERE id=%s"
                         .format(", ".join(sets)), tuple(args))
-
-
-class _Unset:
-    def __repr__(self):
-        return "<unset>"
-
-
-_UNSET = _Unset()
 
 
 def rollup_email(email_id):
