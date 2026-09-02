@@ -486,6 +486,46 @@ def test_full_timeline_for_one_ticket():
           not touched, str(touched))
 
 
+def test_analytics_push_is_append_only():
+    """Zoho Analytics is an append-only snapshot log, by request.
+
+    No key, no unique id, no upsert: a ticket gets a FRESH row each time its
+    journey moves, and nothing already in Analytics is ever modified. So the
+    import must be a plain append - matchingColumns or updateadd would silently
+    reintroduce the matching the user ruled out."""
+    print("\n8. the Analytics import appends, and never matches")
+    push = load("push_analytics", ROOT / "db" / "push_analytics.py")
+    cfg = push.import_config()
+
+    check("importType is append", cfg.get("importType") == "append",
+          cfg.get("importType"))
+    check("no matching columns are sent", "matchingColumns" not in cfg, cfg)
+    check("nothing asks Analytics to update or truncate",
+          cfg.get("importType") not in ("updateadd", "truncateadd"))
+    check("sent as JSON", cfg.get("fileType") == "json", cfg.get("fileType"))
+    check("dates are declared, not guessed",
+          cfg.get("dateFormat") == "dd-MM-yyyy HH:mm:ss", cfg.get("dateFormat"))
+
+
+def test_only_changed_tickets_are_selected():
+    """The push must send what has MOVED, not everything it can see.
+
+    With append and no matching, re-sending an unchanged ticket adds a
+    duplicate row that nothing will ever clean up. ticket_events is the signal:
+    append-only, so a ticket has moved exactly when it has an event newer than
+    the one last pushed."""
+    print("\n9. only tickets whose journey moved are pushed")
+    push = load("push_analytics", ROOT / "db" / "push_analytics.py")
+    sql = " ".join(push.PENDING_SQL.split())
+
+    check("it reads the journey view", "ticket_journey" in sql, sql[:120])
+    check("it compares against the last pushed event",
+          "analytics_pushes" in sql and "last_event_id" in sql, sql[:200])
+    check("an unpushed ticket still qualifies", "coalesce" in sql.lower(),
+          sql[:200])
+    check("it is driven by ticket_events", "ticket_events" in sql, sql[:200])
+
+
 if __name__ == "__main__":
     print("=" * 68)
     print("PERSISTENCE LAYER")
@@ -498,6 +538,8 @@ if __name__ == "__main__":
     test_the_line_keeps_its_desk_comment()
     test_every_followup_is_its_own_row()
     test_full_timeline_for_one_ticket()
+    test_analytics_push_is_append_only()
+    test_only_changed_tickets_are_selected()
     print()
     if FAILED:
         print("{} FAILED: {}".format(len(FAILED), ", ".join(FAILED)))

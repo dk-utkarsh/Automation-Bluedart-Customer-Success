@@ -3133,6 +3133,32 @@ def followup_due(thread, now=None):
     return now >= due
 
 
+def push_to_analytics():
+    """Send any ticket whose journey moved to Zoho Analytics. Best-effort.
+
+    Runs as a SEPARATE PROCESS on purpose. The escalation pipeline must never
+    fail because a reporting push did - an expired token or a Zoho outage costs
+    a report, an escalation that does not go out costs a customer - and a child
+    process cannot take this one down with it.
+
+    Silent no-op when Analytics is not configured, so a checkout without ZA_*
+    keys behaves exactly as it did before."""
+    script = BASE / "db" / "push_analytics.py"
+    if not script.exists() or not (ENV.get("ZA_REFRESH_TOKEN") or "").strip():
+        return
+    try:
+        r = subprocess.run([sys.executable, str(script)], cwd=str(BASE),
+                           capture_output=True, text=True, timeout=180)
+        out = (r.stdout or "").strip()
+        if out:
+            print(out)
+        if r.returncode and (r.stderr or "").strip():
+            print("  analytics: {}".format(r.stderr.strip().splitlines()[-1][:160]))
+    except Exception as e:
+        # Including a timeout. Never re-raised: see the docstring.
+        print("  analytics push skipped ({}: {})".format(e.__class__.__name__, e))
+
+
 def process_replies(verbose=True, dry=False):
     """Apply any new reply statuses to their tickets. Returns count of comments made.
 
@@ -3149,7 +3175,11 @@ def process_replies(verbose=True, dry=False):
     # the window in which another process's append would be lost. webhook_server.py
     # drives this from a separate process, and --watch from another again.
     with threads_lock(label="process_replies"):
-        return _process_replies(verbose=verbose, dry=False)
+        made = _process_replies(verbose=verbose, dry=False)
+    # Outside the lock deliberately: the push reads Postgres, not threads.json,
+    # and holding the file lock across an HTTP call would stall the daily run.
+    push_to_analytics()
+    return made
 
 
 def _process_replies(verbose=True, dry=False):
@@ -3361,7 +3391,9 @@ def run_followups(verbose=True, now=None):
     # Locked: without it a concurrent reply scan can write back a copy loaded
     # before followup_sent_ist was stamped, and the courier is nudged twice.
     with threads_lock(label="run_followups"):
-        return _run_followups(verbose, now)
+        sent = _run_followups(verbose, now)
+    push_to_analytics()
+    return sent
 
 
 def _run_followups(verbose=True, now=None):
@@ -3772,6 +3804,8 @@ def main():
                           keep=flag("--keep-files"))
     else:
         print("\n(--tickets/--skip-desk run: watermark and files left untouched)")
+
+    push_to_analytics()
 
     banner("Done in {:.0f}s".format(time.time() - started))
     print("  tickets  : {}".format(names[0]))

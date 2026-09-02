@@ -326,6 +326,27 @@ DO $ev$ BEGIN
                               'delivered','rto'));
 END $ev$;
 
+-- ================================================================ analytics_pushes
+-- What has already been sent to Zoho Analytics, and how far.
+--
+-- Analytics is append-only by request: no key, no upsert, no matching. That
+-- makes it a snapshot log - a ticket gets a fresh row each time its journey
+-- moves - which only works if this end knows what it already sent. Without it
+-- every push would re-send every ticket and the table would double each run.
+--
+-- ticket_events is the change signal. It is append-only, so a ticket has moved
+-- if and only if it has an event newer than the one last pushed. This table is
+-- bookkeeping about the push, not about the ticket, which is why it lives here
+-- rather than as a column on tickets.
+CREATE TABLE IF NOT EXISTS analytics_pushes (
+    ticket_number text PRIMARY KEY REFERENCES tickets(ticket_number),
+    last_event_id bigint      NOT NULL,
+    push_count    int         NOT NULL DEFAULT 1,
+    first_push_at timestamptz NOT NULL DEFAULT now(),
+    pushed_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS analytics_pushes_at ON analytics_pushes (pushed_at DESC);
+
 -- ================================================================ ticket_journey
 -- THE REPORTING SOURCE. One row per ticket, the whole journey flattened.
 --
