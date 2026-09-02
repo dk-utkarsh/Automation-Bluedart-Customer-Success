@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -76,18 +77,63 @@ USER, PW, HOST, PORT, DB = M.groups()
 def csv_query(sql):
     """Run a query and return (header, rows)."""
     r = subprocess.run(
-        ["psql", "-h", HOST, "-p", PORT, "-U", USER, "-d", DB, "--csv", "-c", sql],
+        ["psql", "-h", HOST, "-p", PORT, "-U", USER, "-d", DB, "--csv",
+         "-c", sql],
         capture_output=True, text=True,
         # Inherit the caller's environment rather than replacing it: pinning PATH
         # to /usr/bin:/bin meant psql could only ever be found on one server.
-        env={**os.environ, "PGPASSWORD": PW})
+        #
+        # PGTZ, not a second -c "SET TIME ZONE": psql prints "SET" for that
+        # statement too, and --csv then reads it as the header row, shifting
+        # every column by one. libpq applies PGTZ to the session silently.
+        # It matters because timestamptz renders in the session's zone and
+        # everything here happened in IST - without it every time is 5h30m out.
+        env={**os.environ, "PGPASSWORD": PW, "PGTZ": "Asia/Kolkata"})
     if r.returncode:
         raise SystemExit("psql failed: " + r.stderr.strip())
     rows = list(csv.reader(io.StringIO(r.stdout)))
     return (rows[0], rows[1:]) if rows else ([], [])
 
 
-def style(ws, header, rows, widths_from=None):
+# Postgres renders these as text through --csv. Excel - and Zoho Analytics
+# reading the sheet - want real date cells, so they are converted back.
+TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T]"
+                   r"(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
+                   r"(?:[+-]\d{2}(?::?\d{2})?)?$")
+DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+# What Zoho Analytics is told to expect: dd-MM-yyyy HH:mm:ss. The cells hold
+# real datetimes, so the value is unambiguous whatever the format shows.
+DT_FMT = "DD-MM-YYYY HH:MM:SS"
+D_FMT = "DD-MM-YYYY"
+
+
+def as_date(v):
+    """A real datetime/date for a timestamp string, else None."""
+    if not isinstance(v, str) or not v:
+        return None
+    m = TS_RE.match(v)
+    if m:
+        y, mo, d, hh, mi, ss = (int(x) for x in m.groups())
+        # tzinfo is dropped on purpose: the value is already IST and Excel has
+        # no concept of a zone, so carrying one would only invite confusion.
+        return datetime(y, mo, d, hh, mi, ss), DT_FMT
+    m = DATE_RE.match(v)
+    if m:
+        return date(*(int(x) for x in m.groups())), D_FMT
+    return None
+
+
+# Filled from information_schema once it has been read: {(relation, column):
+# data_type}. Counts are converted to real numbers off the DECLARED type, never
+# by guessing from the digits - ticket_number and awb are text and must stay
+# text, leading zeros and all.
+TYPES = {}
+NUMERIC = ("integer", "bigint", "smallint", "numeric", "double precision",
+           "real")
+
+
+def style(ws, header, rows, widths_from=None, relation=None):
     """Header styling, freeze, autofilter, sane column widths."""
     for i, h in enumerate(header, 1):
         c = ws.cell(row=1, column=i, value=h)
@@ -98,7 +144,18 @@ def style(ws, header, rows, widths_from=None):
             # Excel rejects anything over 32767 chars in one cell.
             if isinstance(v, str) and len(v) > 32000:
                 v = v[:32000] + "  ...[truncated]"
-            ws.cell(row=r, column=i, value=v).font = MONO
+            conv = as_date(v)
+            if conv is None and v not in (None, "") and relation:
+                typ = TYPES.get((relation, header[i - 1]), "")
+                if typ.startswith(NUMERIC):
+                    try:
+                        v = int(v) if "." not in v else float(v)
+                    except (TypeError, ValueError):
+                        pass
+            cell = ws.cell(row=r, column=i, value=conv[0] if conv else v)
+            cell.font = MONO
+            if conv:
+                cell.number_format = conv[1]
     ws.freeze_panes = "A2"
     if header and rows:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{len(rows) + 1}"
@@ -124,6 +181,9 @@ JOIN pg_class pc ON pc.relname = c.table_name AND pc.relnamespace='public'::regn
 JOIN pg_attribute a ON a.attrelid = pc.oid AND a.attname = c.column_name
 WHERE c.table_schema='public'
 ORDER BY c.table_name, c.ordinal_position""")
+
+for _row in cols:
+    TYPES[(_row[0], _row[2])] = _row[3]
 
 key_hdr, keys = csv_query("""
 SELECT cl.relname, a.attname,
@@ -192,7 +252,7 @@ style(ws, ["from_column", "", "to_column", "on_delete", "what it means"],
 for t, order in TABLES:
     h, rows = csv_query(f"SELECT * FROM {t} ORDER BY {order}")
     ws = wb.create_sheet(t)
-    style(ws, h, rows)
+    style(ws, h, rows, relation=t)
 
 wb.save(OUT)
 print(f"wrote {OUT}")
