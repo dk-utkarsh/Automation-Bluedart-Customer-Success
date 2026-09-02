@@ -7,6 +7,10 @@
 # Generated data. Recreated by every run, and contains customer PII.
 output/
 
+# Database exports kept for reference. Same PII, but NOT the pipeline's working
+# folder - nothing here is deleted when a run cleans up after itself.
+exports/
+
 # Runtime state - machine-specific, and meaningless on another checkout.
 state.json
 awb_registry.json
