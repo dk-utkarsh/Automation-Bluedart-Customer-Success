@@ -63,26 +63,55 @@ def _warn(exc):
               .format(exc.__class__.__name__, exc))
 
 
+class Unavailable(RuntimeError):
+    """Postgres could not be reached for something that MUST be read.
+
+    Raised only by strict callers. The run state lives in the database now, and
+    a caller that cannot read it must stop rather than carry on with an empty
+    state - an empty state reads as "no watermark", which restarts the window
+    at today 00:00 and silently skips every unprocessed ticket before
+    midnight."""
+
+
 class _Conn:
     """Context manager yielding a cursor, committing on success.
 
     Swallows every database error by design - see the module docstring. Returns
     None as the cursor when persistence is off, so callers guard with `if cur`.
+
+    strict=True inverts that for the few reads that cannot be skipped: it raises
+    Unavailable instead of handing back None.
     """
+
+    def __init__(self, strict=False):
+        self.strict = strict
 
     def __enter__(self):
         self.conn = None
         if not enabled():
+            if self.strict:
+                raise Unavailable(
+                    "DATABASE_URL is not set or no psycopg driver is installed")
             return None
         try:
             self.conn = psycopg.connect(_URL)
             return self.conn.cursor()
         except Exception as e:
+            if self.strict:
+                raise Unavailable(str(e))
             _warn(e)
             self.conn = None
             return None
 
     def __exit__(self, exc_type, exc, tb):
+        if self.strict:
+            # A strict caller handles its own failures; nothing is swallowed.
+            if self.conn is not None:
+                try:
+                    self.conn.commit() if exc_type is None else self.conn.rollback()
+                finally:
+                    self.conn.close()
+            return False
         if self.conn is None:
             return exc_type is not None and issubclass(exc_type, Exception)
         try:
@@ -102,8 +131,116 @@ class _Conn:
         return exc_type is not None and issubclass(exc_type, Exception)
 
 
-def tx():
-    return _Conn()
+def tx(strict=False):
+    return _Conn(strict=strict)
+
+
+def _iso(v):
+    """Timestamps go back to main.py as ISO strings, the shape state.json used,
+    so resolve_window and the pending block need no changes at all."""
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+# ------------------------------------------------------------- run state
+def load_state():
+    """The run state main.py used to read from state.json.
+
+    Two rows answer it: the newest COMMITTED run carries the watermark, and the
+    single PENDING row - if there is one - is a run that never finished and has
+    to be resumed rather than re-fetched.
+
+    Strict on purpose. Returning {} when Postgres is unreachable would read as
+    "no watermark ever committed", which restarts the window at today 00:00 and
+    drops every unprocessed ticket created before midnight."""
+    state = {}
+    with tx(strict=True) as cur:
+        cur.execute(
+            "SELECT watermark_ticket, watermark_utc, modified_utc, export_file,"
+            "       rows_count, finished_at "
+            "  FROM runs WHERE status='committed' "
+            " ORDER BY finished_at DESC NULLS LAST, id DESC LIMIT 1")
+        row = cur.fetchone()
+        if row:
+            state["last_ticket_number"] = row[0]
+            state["last_created_utc"] = _iso(row[1])
+            state["last_modified_utc"] = _iso(row[2])
+            state["last_file"] = row[3]
+            state["rows"] = row[4]
+            state["last_run_ist"] = _iso(row[5])
+
+        cur.execute(
+            "SELECT id, export_file, attempts, stage_reached, mailer_sent, "
+            "       watermark_ticket, watermark_utc, modified_utc "
+            "  FROM runs WHERE status='pending' ORDER BY id DESC LIMIT 1")
+        p = cur.fetchone()
+        if p:
+            state["db_run_id"] = p[0]
+            state["pending"] = {
+                "export_file": p[1],
+                "attempts": p[2],
+                "stage_reached": p[3],
+                "mailer_sent": p[4],
+                "watermark_ticket": p[5],
+                "watermark_utc": _iso(p[6]),
+                "modified_utc": _iso(p[7]),
+            }
+    return state
+
+
+def seed_from_file(state):
+    """One-time migration: put state.json's contents into runs.
+
+    Faithful on purpose, pending block included. Migrating only the committed
+    watermark would leave an in-flight run invisible to the database, and the
+    next run would re-fetch and re-mail its tickets - a duplicate escalation to
+    the courier, which is the one failure this state machine exists to prevent.
+    """
+    with tx(strict=True) as cur:
+        cur.execute(
+            "INSERT INTO runs (started_at, finished_at, status, "
+            "  watermark_ticket, watermark_utc, modified_utc, export_file, "
+            "  rows_count, mailer_sent) "
+            "VALUES (now(), now(), 'committed', %s,%s,%s,%s,%s,%s) RETURNING id",
+            (state.get("last_ticket_number"), state.get("last_created_utc"),
+             state.get("last_modified_utc"), state.get("last_file"),
+             state.get("rows"), bool(state.get("last_mail_sent_ist"))))
+        row = cur.fetchone()
+        p = state.get("pending")
+        if not p:
+            return row[0] if row else None
+        cur.execute(
+            "INSERT INTO runs (started_at, status, watermark_ticket, "
+            "  watermark_utc, modified_utc, export_file, attempts, "
+            "  stage_reached, mailer_sent) "
+            "VALUES (now(), 'pending', %s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (p.get("watermark_ticket"), p.get("watermark_utc"),
+             p.get("modified_utc"), p.get("export_file"),
+             int(p.get("attempts") or 1), p.get("stage_reached"),
+             bool(p.get("mailer_sent"))))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def save_state(state):
+    """Persist the in-flight run. Committing is commit_run's job, not this.
+
+    Only the pending row is written here: everything else in the state dict is
+    derived from rows that are already committed and immutable."""
+    run_id = (state or {}).get("db_run_id")
+    pending = (state or {}).get("pending")
+    if run_id is None or not pending:
+        return
+    with tx(strict=True) as cur:
+        cur.execute(
+            "UPDATE runs SET export_file=%s, attempts=%s, stage_reached=%s, "
+            "  mailer_sent=%s, watermark_ticket=coalesce(%s, watermark_ticket), "
+            "  watermark_utc=coalesce(%s, watermark_utc), "
+            "  modified_utc=coalesce(%s, modified_utc) "
+            "WHERE id=%s",
+            (pending.get("export_file"), int(pending.get("attempts") or 1),
+             pending.get("stage_reached"), bool(pending.get("mailer_sent")),
+             pending.get("watermark_ticket"), pending.get("watermark_utc"),
+             pending.get("modified_utc"), run_id))
 
 
 # ---------------------------------------------------------------- runs

@@ -200,13 +200,34 @@ def banner(text):
 
 
 def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {}
+    """Run state, from Postgres. state.json is migrated once, then never read.
+
+    Raises db.Unavailable if the database cannot be reached. That is deliberate:
+    an empty state reads as "no watermark ever committed", which restarts the
+    window at today 00:00 and silently drops every unprocessed ticket created
+    before midnight. Stopping is the only safe answer."""
+    state = db.load_state()
+    if not state.get("last_created_utc") and STATE_FILE.exists():
+        # Cutover. Without this the first database-backed run would reset the
+        # watermark to today 00:00 and skip everything before it.
+        old = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if old.get("last_created_utc"):
+            db.seed_from_file(old)
+            retired = STATE_FILE.with_suffix(".json.migrated")
+            try:
+                STATE_FILE.replace(retired)
+            except OSError:
+                pass
+            print("  db: migrated state.json into runs (watermark #{}); the "
+                  "file is now {}".format(old.get("last_ticket_number"),
+                                          retired.name))
+            state = db.load_state()
+    return state
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    """Persist the in-flight run. Nothing is written to disk any more."""
+    db.save_state(state)
 
 
 def start_pending(state, export_path, watermark, modified_utc=None):
@@ -494,9 +515,7 @@ def resolve_window(force_today, force_now):
     if force_now or now_ist < cutoff_ist:
         cutoff_ist = now_ist
 
-    state = {}
-    if STATE_FILE.exists():
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    state = load_state()
 
     if not force_today and state.get("last_created_utc"):
         # Incremental: strictly after the last ticket already exported.
@@ -865,8 +884,15 @@ def run_desk_fetch(state, force_today=False, force_now=False):
                             modified_mark.isoformat() if modified_mark else None)
 
     print("\nSaved: {}".format(out))
-    print("Rows : {}  (#{} -> #{})".format(
-        len(kept), kept[0]["ticketNumber"], kept[-1]["ticketNumber"]))
+    # kept can be empty while dropped is not - every logistics ticket in the
+    # window was an AWB duplicate. Indexing kept[0] there raised IndexError
+    # AFTER start_pending had written the pending run, leaving a run that could
+    # never complete and blocking every later run behind it.
+    if kept:
+        print("Rows : {}  (#{} -> #{})".format(
+            len(kept), kept[0]["ticketNumber"], kept[-1]["ticketNumber"]))
+    else:
+        print("Rows : 0 kept, {} duplicate(s) dropped".format(len(dropped)))
     print("State: watermark #{} held pending the mailer (attempt {})".format(
         watermark["ticketNumber"], pending["attempts"]))
     print("AWBs : {} tracked in {}".format(len(registry), AWB_FILE.name))

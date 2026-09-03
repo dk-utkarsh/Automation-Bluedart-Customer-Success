@@ -30,6 +30,15 @@ spec.loader.exec_module(m)
 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="lateedit-"))
 m.STATE_FILE = TMP / "state.json"
+
+# Run state now lives in Postgres. These tests exercise the pending/watermark
+# STATE MACHINE, not where it is stored, so they keep the old file-backed
+# storage and leave the database backend to tests/test_state_in_db.py.
+m.load_state = lambda: (json.loads(m.STATE_FILE.read_text(encoding="utf-8"))
+                        if m.STATE_FILE.exists() else {})
+m.save_state = lambda st: m.STATE_FILE.write_text(
+    json.dumps(st, indent=2), encoding="utf-8")
+
 m.OUT = TMP / "output"
 m.OUT.mkdir()
 m.ENV = {}
@@ -38,6 +47,20 @@ m.require_env = lambda *a, **k: None
 m.get_token = lambda: "stub"
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+
+
+# The fixtures are pinned to NOW, so the clock main.py reads must be pinned too.
+# It was not: resolve_window called the real datetime.now(), so the 14-day
+# late-edit lookback floor drifted forward every day while the fixtures stayed
+# put. On 03 Sep 2026 the floor passed the LATE ticket's creation date and this
+# test began failing on a change to the calendar rather than a change to code.
+class _Frozen(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+
+
+m.datetime = _Frozen
 
 
 def z(dt):

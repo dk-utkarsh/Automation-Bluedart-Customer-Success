@@ -32,6 +32,15 @@ spec.loader.exec_module(m)
 
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="failsafe-"))
 m.STATE_FILE = TMP / "state.json"
+
+# Run state now lives in Postgres. These tests exercise the pending/watermark
+# STATE MACHINE, not where it is stored, so they keep the old file-backed
+# storage and leave the database backend to tests/test_state_in_db.py.
+m.load_state = lambda: (json.loads(m.STATE_FILE.read_text(encoding="utf-8"))
+                        if m.STATE_FILE.exists() else {})
+m.save_state = lambda st: m.STATE_FILE.write_text(
+    json.dumps(st, indent=2), encoding="utf-8")
+
 m.OUT = TMP / "output"
 m.OUT.mkdir()
 export = m.OUT / "Zoho_Desk_Logistics_TEST.xlsx"
